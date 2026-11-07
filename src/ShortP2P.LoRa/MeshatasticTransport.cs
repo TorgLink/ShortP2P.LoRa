@@ -161,6 +161,37 @@ public sealed class MeshatasticTransport : ITransport
         _ = PersistDirectoryAsync(CancellationToken.None);
     }
 
+    /// <summary>Nodes the board reported in its node database. Empty when the link has no catalog.</summary>
+    public IReadOnlyList<MeshtasticRadioNode> RadioNodes =>
+        _link is IMeshNodeCatalog catalog ? catalog.Nodes : [];
+
+    /// <summary>Ask the board to resend its node database (want_config) and wait until it finishes.</summary>
+    public ValueTask RefreshRadioNodesAsync(CancellationToken cancellationToken = default)
+    {
+        if (_link is IMeshNodeCatalog catalog)
+            return catalog.RefreshAsync(cancellationToken);
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>Inbound presence ping (frame 0x31): from node, to node, raw frame.</summary>
+    public event Action<uint, uint, byte[]>? PresenceReceived;
+
+    /// <summary>Send one already-framed datagram (presence 0x31, directory, retry). Not a chat frame.</summary>
+    public Task SendOpaqueAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    {
+        return SendDatagramAsync(node, payload, cancellationToken);
+    }
+
+    /// <summary>Broadcast the directory so other TorgLink radios can answer a scan.</summary>
+    public async Task AnnounceDirectoryAsync(CancellationToken cancellationToken = default)
+    {
+        var localId = _options.LocalNetworkId;
+        if (!_started || localId == null)
+            return;
+        var snapshot = MeshDirectorySnapshotCodec.Encode(localId, Directory.Snapshot());
+        await SendDatagramAsync(BroadcastNode, snapshot, cancellationToken).ConfigureAwait(false);
+    }
+
     // ---- datagram send path ----
 
     private void EnsureTxAllowed()
@@ -253,6 +284,9 @@ public sealed class MeshatasticTransport : ITransport
             case RetryRequestCodec.FrameByte:
                 OnRetryRequestFrame(frame.From, bytes);
                 return;
+            case 0x31:
+                PresenceReceived?.Invoke(frame.From, frame.To, bytes);
+                return;
             case 0x30:
             case 0x01:
             case 0x04:
@@ -295,6 +329,12 @@ public sealed class MeshatasticTransport : ITransport
 
     private void ProcessDatagram(byte[] datagram, uint fromNode)
     {
+        if (datagram.Length > 0 && datagram[0] == 0x31)
+        {
+            PresenceReceived?.Invoke(fromNode, 0, datagram);
+            return;
+        }
+
         var from = MeshId.FromNodeNumber(fromNode);
         if (FrameNetworkId.TryExtract(datagram, out var networkId))
         {

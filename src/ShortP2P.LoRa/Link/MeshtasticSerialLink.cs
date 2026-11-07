@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Ports;
 using Microsoft.Extensions.Logging;
 
@@ -8,17 +9,21 @@ namespace ShortP2P.LoRa.Link;
 ///     Board model/name is not configured: after the port opens, the board reports
 ///     its node number and firmware identity itself.
 /// </summary>
-public sealed class MeshtasticSerialLink : IMeshLink
+public sealed class MeshtasticSerialLink : IMeshLink, IMeshNodeCatalog
 {
     private readonly string _portName;
     private readonly int _baudRate;
     private readonly ILogger? _logger;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
 
+    private readonly ConcurrentDictionary<uint, MeshtasticRadioNode> _nodes = new();
+
     private SerialPort? _port;
     private CancellationTokenSource? _cts;
     private Task? _readTask;
     private long _packetId = Random.Shared.Next(1, int.MaxValue);
+    private int _configWaitId;
+    private TaskCompletionSource<bool>? _configWait;
 
     public MeshtasticSerialLink(string portName, int baudRate = 115200, ILogger? logger = null)
     {
@@ -30,6 +35,8 @@ public sealed class MeshtasticSerialLink : IMeshLink
     }
 
     public uint? LocalNodeNumber { get; private set; }
+
+    public IReadOnlyList<MeshtasticRadioNode> Nodes => _nodes.Values.ToArray();
 
     public event Action<MeshLinkFrame>? Received;
 
@@ -93,6 +100,32 @@ public sealed class MeshtasticSerialLink : IMeshLink
         }
 
         _logger?.LogInformation("Meshtastic serial link on {Port} stopped", _portName);
+    }
+
+    public async ValueTask RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        if (_port is not { IsOpen: true })
+            return;
+
+        _nodes.Clear();
+        var id = Random.Shared.Next(2, int.MaxValue);
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _configWait = tcs;
+        Volatile.Write(ref _configWaitId, id);
+
+        var want = MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig((uint)id));
+        await WriteRawAsync(want, cancellationToken).ConfigureAwait(false);
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            await tcs.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Partial node list is still usable when the board never sends config_complete_id.
+        }
     }
 
     public async ValueTask SendAsync(uint to, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
@@ -223,6 +256,17 @@ public sealed class MeshtasticSerialLink : IMeshLink
                 {
                     LocalNodeNumber = node;
                     _logger?.LogInformation("Board reported local node number {Node:X8}", node);
+                },
+                onNode: node =>
+                {
+                    _nodes[node.NodeNumber] = node;
+                    _logger?.LogInformation("Meshtastic node {Id} {Name}", node.NodeId, node.DisplayName);
+                },
+                onConfigComplete: id =>
+                {
+                    var waitId = Volatile.Read(ref _configWaitId);
+                    if (waitId != 0 && id == (uint)waitId)
+                        _configWait?.TrySetResult(true);
                 });
         }
         catch (Exception ex)

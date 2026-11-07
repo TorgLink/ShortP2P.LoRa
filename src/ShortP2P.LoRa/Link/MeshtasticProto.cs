@@ -72,11 +72,14 @@ internal static class MeshtasticProto
     /// <summary>One parsed protobuf field. Bytes is valid only for length-delimited / fixed fields.</summary>
     internal delegate void ProtoFieldHandler(int number, int wireType, uint varint, ReadOnlySpan<byte> bytes);
 
-    /// <summary>Parse a FromRadio payload; invokes handlers for packet / my_info fields.</summary>
+    /// <summary>
+    ///     Parse a FromRadio payload. Handles packet, my_info, node_info (field 4) and
+    ///     config_complete_id (field 7) from the Meshtastic mesh protobufs.
+    /// </summary>
     public static void ReadFromRadio(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket,
-        Action<uint>? onMyNodeNum)
+        Action<uint>? onMyNodeNum, Action<MeshtasticRadioNode>? onNode = null, Action<uint>? onConfigComplete = null)
     {
-        ReadFields(payload, (number, wireType, _, bytes) =>
+        ReadFields(payload, (number, wireType, varint, bytes) =>
         {
             switch (number)
             {
@@ -85,6 +88,12 @@ internal static class MeshtasticProto
                     break;
                 case 3 when wireType == 2:
                     TryReadMyNodeInfo(bytes, onMyNodeNum);
+                    break;
+                case 4 when wireType == 2:
+                    TryReadNodeInfo(bytes, onNode);
+                    break;
+                case 7 when wireType == 0:
+                    onConfigComplete?.Invoke(varint);
                     break;
             }
         });
@@ -140,6 +149,51 @@ internal static class MeshtasticProto
             if (number == 1 && wireType == 0)
                 onMyNodeNum?.Invoke(varint);
         });
+    }
+
+    /// <summary>NodeInfo: num=1, user=2 (User.id=1, long_name=2, short_name=3).</summary>
+    private static void TryReadNodeInfo(ReadOnlySpan<byte> payload, Action<MeshtasticRadioNode>? onNode)
+    {
+        if (onNode == null)
+            return;
+
+        uint num = 0;
+        var longName = "";
+        var shortName = "";
+        var userId = "";
+        ReadFields(payload, (number, wireType, varint, bytes) =>
+        {
+            switch (number, wireType)
+            {
+                case (1, 0):
+                    num = varint;
+                    break;
+                case (2, 2):
+                    ReadFields(bytes, (n, w, _, b) =>
+                    {
+                        if (w != 2)
+                            return;
+                        var text = System.Text.Encoding.UTF8.GetString(b);
+                        switch (n)
+                        {
+                            case 1:
+                                userId = text;
+                                break;
+                            case 2:
+                                longName = text;
+                                break;
+                            case 3:
+                                shortName = text;
+                                break;
+                        }
+                    });
+                    break;
+            }
+        });
+
+        if (num == 0 || num == 0xFFFFFFFF)
+            return;
+        onNode(new MeshtasticRadioNode(num, longName, shortName, userId));
     }
 
     /// <summary>Walk top-level protobuf fields. Unknown / malformed fields end the walk.</summary>
