@@ -207,8 +207,12 @@ public sealed class MeshatasticTransport : ITransport
         await _txWindow.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var first = payload.Length > 0 ? payload.Span[0] : (byte)0;
             if (payload.Length <= _options.MaxRadioPayloadBytes)
             {
+                _logger?.LogInformation(
+                    "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} (single radio frame)",
+                    first, payload.Length, node);
                 await SendFrameWithRetryAsync(node, payload, cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -219,6 +223,10 @@ public sealed class MeshatasticTransport : ITransport
             var total = (ushort)((payload.Length + chunkDataSize - 1) / chunkDataSize);
             var frame = new byte[_options.MaxRadioPayloadBytes];
 
+            _logger?.LogInformation(
+                "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id})",
+                first, payload.Length, node, total, id);
+
             for (ushort number = 1; number <= total; number++)
             {
                 var offset = (number - 1) * chunkDataSize;
@@ -228,8 +236,6 @@ public sealed class MeshatasticTransport : ITransport
             }
 
             _outbox[OutboxKey(node, id)] = new OutboxEntry(payload.ToArray(), node, DateTime.UtcNow);
-            _logger?.LogTrace("TX {Bytes} bytes to {Node:X8} as {Total} chunks (id {Id})", payload.Length, node, total,
-                id);
         }
         finally
         {

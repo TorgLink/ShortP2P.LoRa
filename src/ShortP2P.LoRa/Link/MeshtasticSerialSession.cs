@@ -113,7 +113,7 @@ internal sealed class MeshtasticSerialSession
         if (_port is not { IsOpen: true })
             throw new IOException("Serial port is closed.");
 
-        Logger?.LogTrace("TX to {To:X8}, {Len} bytes", to, payload.Length);
+        Logger?.LogInformation("LoRa serial TX → {To:X8}, payload {Len} bytes", to, payload.Length);
         var framed = MeshtasticProto.Frame(
             MeshtasticProto.BuildToRadioPacket(to, NextPacketId(), payload.ToArray(), hopLimit: 3));
         WriteRaw(framed);
@@ -295,8 +295,10 @@ internal sealed class MeshtasticSerialSession
                 payload,
                 onPacket: frame =>
                 {
-                    Logger?.LogTrace("RX from {From:X8} to {To:X8}, {Len} bytes", frame.From, frame.To,
-                        frame.Payload.Length);
+                    Logger?.LogInformation(
+                        "LoRa serial RX ← {From:X8} to {To:X8}, payload {Len} bytes (first=0x{First:X2})",
+                        frame.From, frame.To, frame.Payload.Length,
+                        frame.Payload.Length > 0 ? frame.Payload[0] : 0);
                     try
                     {
                         Received?.Invoke(frame);
