@@ -16,7 +16,7 @@ public sealed record MeshatasticTransportOptions
 
     public int BaudRate { get; init; } = 115200;
 
-    /// <summary>Selected jurisdiction. Default UNSET → no TX until a region is chosen (REQ-RF-2).</summary>
+    /// <summary>Selected jurisdiction. Default UNSET — TX is allowed at the 1% default duty cycle (REQ-RF-2).</summary>
     public JurisdictionProfile Jurisdiction { get; init; } = JurisdictionCatalog.Unset;
 
     public RetryConfig Retry { get; init; } = new();

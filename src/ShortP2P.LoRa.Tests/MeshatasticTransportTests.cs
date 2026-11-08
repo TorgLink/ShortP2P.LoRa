@@ -149,15 +149,16 @@ public class MeshatasticTransportTests
     }
 
     [Fact]
-    public async Task Unset_Jurisdiction_Blocks_Transmit()
+    public async Task Unset_Jurisdiction_Allows_Transmit_At_Default_Duty_Cycle()
     {
         var (linkA, _) = FakeMeshLink.CreatePair(AliceNode, BobNode);
         var options = MakeOptions(jurisdiction: JurisdictionCatalog.Unset);
         var a = new MeshatasticTransport(options, linkA);
         await a.StartAsync();
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => a.SendAsync(Cipher(), Addr(BobNode)).AsTask());
-        Assert.Empty(linkA.Sent);
+        // REQ-RF-2: UNSET no longer blocks TX — the 1% default duty cycle applies instead.
+        await a.SendAsync(Cipher(), Addr(BobNode));
+        Assert.Single(linkA.Sent);
         await a.DisposeAsync();
     }
 

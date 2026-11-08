@@ -3,6 +3,7 @@ using System.IO.Ports;
 using System.IO;
 using Microsoft.Extensions.Logging;
 using ShortP2P.LoRa.Link;
+using ShortP2P.LoRa.Reliability;
 
 namespace ShortP2P.LoRa;
 
@@ -12,6 +13,8 @@ namespace ShortP2P.LoRa;
 ///     single dedicated radio thread. Callers from any thread marshal through the gate command queue;
 ///     device state is published only as immutable <see cref="MeshtasticLinkState" /> snapshots.
 ///     Port access from any other thread is forbidden and enforced by <see cref="MeshtasticSerialSession" />.
+///     The gate also enforces the REQ-RF-2 duty-cycle budget (default TX 1% / RX 99% of estimated airtime
+///     over a rolling hour): TX that does not fit the window is deferred, never silently dropped.
 /// </summary>
 public sealed class MeshtasticGate
 {
@@ -24,6 +27,12 @@ public sealed class MeshtasticGate
     /// <summary>The only gate instance in the process.</summary>
     public static MeshtasticGate Instance => InstanceField;
 
+    /// <summary>REQ-RF-2 default product duty cycle: TX 1% / RX 99% of estimated airtime.</summary>
+    public const double DefaultDutyCyclePercent = 1.0;
+
+    /// <summary>ToRadio protobuf overhead on top of the payload, for the airtime estimate.</summary>
+    private const int RadioOverheadBytes = 16;
+
     private readonly BlockingCollection<Action> _commands = new(new ConcurrentQueue<Action>());
     private readonly Thread _radioThread;
 
@@ -31,6 +40,8 @@ public sealed class MeshtasticGate
     private MeshtasticSerialSession? _session;
     private object? _sessionToken;
     private TaskCompletionSource<bool>? _nodeNumberWait;
+    private DutyCycleBudget _duty = new(DefaultDutyCyclePercent);
+    private readonly List<DeferredSend> _deferred = [];
 
     private volatile MeshtasticLinkState _state = MeshtasticLinkState.Closed;
 
@@ -69,6 +80,23 @@ public sealed class MeshtasticGate
         }
     }
 
+    /// <summary>
+    ///     REQ-RF-2 policy applied on the radio thread: TX ≤ <paramref name="dutyCyclePercent" /> of
+    ///     estimated on-air time over a rolling one-hour window (Meshtastic EU semantics), remainder RX.
+    ///     The host clamps the default 1% to the selected region cap and applies this before starting
+    ///     the transport. Replacing the budget resets the window accounting.
+    /// </summary>
+    public Task ConfigureDutyCycleAsync(double dutyCyclePercent, double airtimePerByteMs,
+        CancellationToken cancellationToken = default)
+    {
+        var task = EnqueueRadio<object?>(() =>
+        {
+            _duty = new DutyCycleBudget(dutyCyclePercent, airtimePerByteMs: airtimePerByteMs);
+            return null;
+        });
+        return task.WaitAsync(cancellationToken);
+    }
+
     // ---- link operations (all marshal to the radio thread) ----
 
     internal object CreateToken() => new();
@@ -91,6 +119,7 @@ public sealed class MeshtasticGate
                     Thread.CurrentThread, logger);
                 session.NodeNumberAnnounced += () => nodeAnnounced.TrySetResult(true);
                 session.Received += frame => FrameReceived?.Invoke(token, frame);
+                session.OnAirtimeWritten += airtimeBytes => _duty.RecordTx(airtimeBytes, DateTime.UtcNow);
                 session.Open();
                 _session = session;
                 _sessionToken = token;
@@ -134,12 +163,71 @@ public sealed class MeshtasticGate
 
     internal Task SendAsync(object token, uint to, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
-        var task = EnqueueRadio<object?>(() =>
+        if (payload.Length == 0)
+            throw new ArgumentException("Payload is empty.", nameof(payload));
+
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var frame = payload.ToArray();
+        _commands.Add(() => TryDeliver(token, to, frame, done));
+        return done.Task.WaitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    ///     Radio thread only. Sends immediately while the duty-cycle budget allows it; otherwise the
+    ///     frame is parked in <see cref="_deferred" /> and fires from the loop when the window slides.
+    ///     The radio thread never blocks waiting for airtime.
+    /// </summary>
+    private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done)
+    {
+        try
         {
-            ActiveSession(token).Send(to, payload);
-            return null;
-        });
-        return task.WaitAsync(cancellationToken);
+            var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+            if (session == null)
+            {
+                done.TrySetException(new IOException("Meshtastic serial link is not started."));
+                return;
+            }
+
+            var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow);
+            if (wait > TimeSpan.Zero)
+            {
+                session.Logger?.LogInformation(
+                    "Duty cycle budget spent ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
+                    _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
+                _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done));
+                return;
+            }
+
+            session.Send(to, payload);
+            done.TrySetResult(true);
+        }
+        catch (Exception ex)
+        {
+            done.TrySetException(ex);
+        }
+    }
+
+    /// <summary>Radio thread only: re-check deferred frames whose airtime slot has arrived.</summary>
+    private void PumpDeferred()
+    {
+        if (_deferred.Count == 0)
+            return;
+
+        List<DeferredSend>? due = null;
+        var now = DateTime.UtcNow;
+        for (var i = _deferred.Count - 1; i >= 0; i--)
+        {
+            if (now >= _deferred[i].DueUtc)
+            {
+                (due ??= []).Add(_deferred[i]);
+                _deferred.RemoveAt(i);
+            }
+        }
+
+        if (due == null)
+            return;
+        foreach (var d in due)
+            TryDeliver(d.Token, d.To, d.Payload, d.Done); // may re-defer with a fresh due time
     }
 
     internal async Task RefreshAsync(object token, CancellationToken cancellationToken)
@@ -186,6 +274,7 @@ public sealed class MeshtasticGate
             {
                 if (_commands.TryTake(out var command, RadioPollMs))
                     command();
+                PumpDeferred();
                 if (_session is { } session && session.Pump())
                     PublishCurrentState();
             }
@@ -213,11 +302,6 @@ public sealed class MeshtasticGate
         return tcs.Task;
     }
 
-    private MeshtasticSerialSession ActiveSession(object token) =>
-        ReferenceEquals(_sessionToken, token)
-            ? _session ?? throw new IOException("Meshtastic serial link is not started.")
-            : throw new IOException("Meshtastic serial link is not started.");
-
     private void CloseSessionCore(string reason)
     {
         var session = _session;
@@ -228,6 +312,9 @@ public sealed class MeshtasticGate
         _sessionToken = null;
         _nodeNumberWait?.TrySetCanceled();
         _nodeNumberWait = null;
+        foreach (var d in _deferred)
+            d.Done.TrySetException(new IOException("Meshtastic serial link is stopped."));
+        _deferred.Clear();
         try
         {
             session.Close();
@@ -247,4 +334,12 @@ public sealed class MeshtasticGate
             ? MeshtasticLinkState.Closed
             : new MeshtasticLinkState(true, session.LocalNodeNumber, session.SnapshotNodes());
     }
+
+    /// <summary>A data frame parked until the duty-cycle window allows its airtime (radio thread only).</summary>
+    private sealed record DeferredSend(
+        DateTime DueUtc,
+        object Token,
+        uint To,
+        byte[] Payload,
+        TaskCompletionSource<bool> Done);
 }

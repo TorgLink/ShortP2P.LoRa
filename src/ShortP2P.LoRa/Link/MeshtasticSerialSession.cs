@@ -14,6 +14,7 @@ internal sealed class MeshtasticSerialSession
 {
     private const int AnnounceRetrySeconds = 1;
     private const int RefreshRetrySeconds = 2;
+    private const int SerialHeaderBytes = 4;
 
     private readonly string _portName;
     private readonly int _baudRate;
@@ -36,6 +37,12 @@ internal sealed class MeshtasticSerialSession
 
     /// <summary>Raised once when the board reports its local node number.</summary>
     internal event Action? NodeNumberAnnounced;
+
+    /// <summary>
+    ///     Called by the gate with the on-air byte count of every frame written to the port
+    ///     (radio payload ≈ serial frame minus the 4-byte header) so the duty-cycle budget can record it.
+    /// </summary>
+    internal Action<int>? OnAirtimeWritten;
 
     internal MeshtasticSerialSession(string portName, int baudRate, Thread owner, ILogger? logger)
     {
@@ -230,6 +237,7 @@ internal sealed class MeshtasticSerialSession
         if (port is not { IsOpen: true })
             throw new IOException("Serial port is closed.");
         port.Write(framed, 0, framed.Length);
+        OnAirtimeWritten?.Invoke(framed.Length - SerialHeaderBytes);
     }
 
     private uint NextPacketId()

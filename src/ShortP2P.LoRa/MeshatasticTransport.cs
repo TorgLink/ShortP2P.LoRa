@@ -204,7 +204,6 @@ public sealed class MeshatasticTransport : ITransport
 
     private async Task SendDatagramAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
-        EnsureTxAllowed();
         await _txWindow.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
