@@ -342,9 +342,14 @@ public sealed class MeshatasticTransport : ITransport
             _ = PersistDirectoryAsync(CancellationToken.None);
         }
 
-        _logger?.LogTrace("RX From: {From} DateTimeUTC: {Utc:yyyy-MM-dd HH:mm:ss.fff}", from.ToHex(), DateTime.UtcNow);
-        _channel.Writer.TryWrite(new TransportReceiveMessage(datagram,
-            MeshatasticTransportAddress.ToTransportAddress(from)));
+        var frame = datagram.Length > 0 ? datagram[0] : (byte)0;
+        _logger?.LogInformation(
+            "RX chat frame 0x{Frame:X2} ({Bytes} bytes) from {From}",
+            frame, datagram.Length, from.ToHex());
+        if (!_channel.Writer.TryWrite(new TransportReceiveMessage(datagram,
+                MeshatasticTransportAddress.ToTransportAddress(from))))
+            _logger?.LogWarning("RX chat frame 0x{Frame:X2} from {From} dropped: inbound channel full", frame,
+                from.ToHex());
     }
 
     private void OnSnapshotFrame(byte[] bytes)
