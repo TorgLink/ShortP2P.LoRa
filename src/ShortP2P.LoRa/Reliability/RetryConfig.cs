@@ -14,11 +14,12 @@ public sealed record RetryConfig
     public TimeSpan RxRetryIntervalBase { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    ///     No next chunk for this long → ask the sender to resend. Default 30 s: a full-size chunk
-    ///     takes seconds of airtime per preset and chunks sit in the board TX queue behind other
-    ///     traffic, so a tighter timeout floods the mesh with spurious resend requests.
+    ///     No next chunk for this long → ask the sender to resend. Default 180 s: under the 1%
+    ///     duty-cycle budget a multi-chunk datagram can sit between radio frames for well over
+    ///     half a minute (presence/keepalive and other chat share the same airtime window), so a
+    ///     30 s timeout falsely aborts reassembly and floods 0x33 resends.
     /// </summary>
-    public TimeSpan RxTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan RxTimeout { get; init; } = TimeSpan.FromSeconds(180);
 
     /// <summary>Receive-side resend requests before the message is dropped. Default 3.</summary>
     public int RxMaxRetries { get; init; } = 3;

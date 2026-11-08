@@ -39,8 +39,11 @@ public sealed record MeshatasticTransportOptions
     /// <summary>How often stalled reassemblies are checked. Default 1 s.</summary>
     public TimeSpan RxSweepInterval { get; init; } = TimeSpan.FromSeconds(1);
 
-    /// <summary>How long a sent datagram is kept for answering 0x33 resend requests.</summary>
-    public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(5);
+    /// <summary>
+    ///     How long a sent datagram is kept for answering 0x33 resend requests.
+    ///     Must cover RxTimeout × (RxMaxRetries+1) under duty-cycle deferral (default ~12 min).
+    /// </summary>
+    public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(15);
 
     internal void Validate()
     {

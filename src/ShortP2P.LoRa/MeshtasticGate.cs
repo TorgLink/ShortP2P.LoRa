@@ -173,9 +173,22 @@ public sealed class MeshtasticGate
     }
 
     /// <summary>
+    ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
+    ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.
+    /// </summary>
+    public Task<TimeSpan> PeekDutyWaitAsync(int payloadBytes, CancellationToken cancellationToken = default)
+    {
+        var task = EnqueueRadio(() =>
+            _duty.WaitTimeFor(Math.Max(0, payloadBytes) + RadioOverheadBytes, DateTime.UtcNow));
+        return task.WaitAsync(cancellationToken);
+    }
+
+    /// <summary>
     ///     Radio thread only. Sends immediately while the duty-cycle budget allows it; otherwise the
     ///     frame is parked in <see cref="_deferred" /> and fires from the loop when the window slides.
     ///     The radio thread never blocks waiting for airtime.
+    ///     Presence (0x31) never jumps ahead of deferred chat/handshake frames, and is dropped
+    ///     outright when chat is already waiting on the budget — keepalives must not starve 0x01/0x04.
     /// </summary>
     private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done)
     {
@@ -188,13 +201,42 @@ public sealed class MeshtasticGate
                 return;
             }
 
+            var isPresence = IsPresencePayload(payload);
+            var hasDeferredChat = _deferred.Exists(static d => !IsPresencePayload(d.Payload));
+
+            if (isPresence && hasDeferredChat)
+            {
+                session.Logger?.LogInformation(
+                    "Skipping presence TX while chat/control frames are duty-cycle deferred");
+                done.TrySetResult(true);
+                return;
+            }
+
             var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow);
             if (wait > TimeSpan.Zero)
             {
+                if (isPresence)
+                {
+                    session.Logger?.LogInformation(
+                        "Skipping presence TX — duty cycle budget spent ({Spent:F1}/{Budget:F1} s)",
+                        _duty.SpentSeconds, _duty.BudgetSeconds);
+                    done.TrySetResult(true);
+                    return;
+                }
+
                 session.Logger?.LogInformation(
                     "Duty cycle budget spent ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
                     _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
                 _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done));
+                return;
+            }
+
+            // Budget allows this frame now, but pending chat must drain before another presence.
+            if (isPresence && _deferred.Count > 0)
+            {
+                session.Logger?.LogInformation(
+                    "Deferring presence TX behind {Count} pending radio frame(s)", _deferred.Count);
+                _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done));
                 return;
             }
 
@@ -226,8 +268,28 @@ public sealed class MeshtasticGate
 
         if (due == null)
             return;
+
+        // Chat/handshake before presence so keepalives cannot steal the first free airtime slot.
+        due.Sort(static (a, b) => TxPriority(a.Payload).CompareTo(TxPriority(b.Payload)));
         foreach (var d in due)
             TryDeliver(d.Token, d.To, d.Payload, d.Done); // may re-defer with a fresh due time
+    }
+
+    private static bool IsPresencePayload(byte[] payload) =>
+        payload.Length > 0 && payload[0] == 0x31;
+
+    /// <summary>Lower value = send sooner when several deferred frames become due together.</summary>
+    private static int TxPriority(byte[] payload)
+    {
+        if (payload.Length == 0)
+            return 50;
+        return payload[0] switch
+        {
+            0x01 or 0x04 or 0x02 => 0, // session setup / route
+            0x33 => 1, // chunk resend request
+            0x31 => 100, // presence keepalive — lowest
+            _ => 10 // cipher / chunks / other
+        };
     }
 
     internal async Task RefreshAsync(object token, CancellationToken cancellationToken)

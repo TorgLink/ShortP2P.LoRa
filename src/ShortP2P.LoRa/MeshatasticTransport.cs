@@ -227,11 +227,16 @@ public sealed class MeshatasticTransport : ITransport
                 "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id})",
                 first, payload.Length, node, total, id);
 
+            // Burst chunks back-to-back while holding the TX window so presence cannot interleave
+            // mid-datagram (duty-cycle deferral still applies per frame inside the gate).
             for (ushort number = 1; number <= total; number++)
             {
                 var offset = (number - 1) * chunkDataSize;
                 var take = Math.Min(chunkDataSize, payload.Length - offset);
                 var written = ChunkCodec.WriteChunk(frame, id, number, total, crc, payload.Span.Slice(offset, take));
+                _logger?.LogInformation(
+                    "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}",
+                    number, total, written, id, node);
                 await SendFrameWithRetryAsync(node, frame.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
             }
 
