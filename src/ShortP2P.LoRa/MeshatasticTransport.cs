@@ -229,7 +229,7 @@ public sealed class MeshatasticTransport : ITransport
             }
 
             _outbox[OutboxKey(node, id)] = new OutboxEntry(payload.ToArray(), node, DateTime.UtcNow);
-            _logger?.LogDebug("TX {Bytes} bytes to {Node:X8} as {Total} chunks (id {Id})", payload.Length, node, total,
+            _logger?.LogTrace("TX {Bytes} bytes to {Node:X8} as {Total} chunks (id {Id})", payload.Length, node, total,
                 id);
         }
         finally
@@ -343,7 +343,7 @@ public sealed class MeshatasticTransport : ITransport
             _ = PersistDirectoryAsync(CancellationToken.None);
         }
 
-        _logger?.LogDebug("RX From: {From} DateTimeUTC: {Utc:yyyy-MM-dd HH:mm:ss.fff}", from.ToHex(), DateTime.UtcNow);
+        _logger?.LogTrace("RX From: {From} DateTimeUTC: {Utc:yyyy-MM-dd HH:mm:ss.fff}", from.ToHex(), DateTime.UtcNow);
         _channel.Writer.TryWrite(new TransportReceiveMessage(datagram,
             MeshatasticTransportAddress.ToTransportAddress(from)));
     }

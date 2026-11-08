@@ -13,8 +13,12 @@ public sealed record RetryConfig
 
     public TimeSpan RxRetryIntervalBase { get; init; } = TimeSpan.FromSeconds(1);
 
-    /// <summary>No next chunk for this long → ask the sender to resend. Default 10 s.</summary>
-    public TimeSpan RxTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>
+    ///     No next chunk for this long → ask the sender to resend. Default 30 s: a full-size chunk
+    ///     takes seconds of airtime per preset and chunks sit in the board TX queue behind other
+    ///     traffic, so a tighter timeout floods the mesh with spurious resend requests.
+    /// </summary>
+    public TimeSpan RxTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>Receive-side resend requests before the message is dropped. Default 3.</summary>
     public int RxMaxRetries { get; init; } = 3;

@@ -30,8 +30,11 @@ public sealed record MeshatasticTransportOptions
     /// <summary>Directory persistence. Default: JSON file under %LocalAppData%.</summary>
     public IMeshDirectoryStore? DirectoryStore { get; init; }
 
-    /// <summary>Max bytes of one Meshtastic data payload this transport emits (≈233 on current firmware).</summary>
-    public int MaxRadioPayloadBytes { get; init; } = 233;
+    /// <summary>Max bytes of one Meshtastic data payload this transport emits.
+    ///     SMT-1 target: 80 bytes per radio frame (ShortP2P fragmentation handles larger datagrams);
+    ///     also safely below the ~222-byte cap most Meshtastic presets enforce (LONG_FAST allows 233).
+    /// </summary>
+    public int MaxRadioPayloadBytes { get; init; } = 80;
 
     /// <summary>How often stalled reassemblies are checked. Default 1 s.</summary>
     public TimeSpan RxSweepInterval { get; init; } = TimeSpan.FromSeconds(1);

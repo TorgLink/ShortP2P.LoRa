@@ -106,6 +106,7 @@ internal sealed class MeshtasticSerialSession
         if (_port is not { IsOpen: true })
             throw new IOException("Serial port is closed.");
 
+        Logger?.LogTrace("TX to {To:X8}, {Len} bytes", to, payload.Length);
         var framed = MeshtasticProto.Frame(
             MeshtasticProto.BuildToRadioPacket(to, NextPacketId(), payload.ToArray(), hopLimit: 3));
         WriteRaw(framed);
@@ -202,6 +203,7 @@ internal sealed class MeshtasticSerialSession
                 return;
             }
 
+            Logger?.LogTrace("Re-sent want_config(1), still waiting for the board node number");
             _nextAnnounceRetryUtc = now.AddSeconds(AnnounceRetrySeconds);
         }
 
@@ -217,6 +219,7 @@ internal sealed class MeshtasticSerialSession
                 return;
             }
 
+            Logger?.LogTrace("Re-sent want_config({Id}) for the node database", _refreshWaitId);
             _nextRefreshRetryUtc = now.AddSeconds(RefreshRetrySeconds);
         }
     }
@@ -284,7 +287,7 @@ internal sealed class MeshtasticSerialSession
                 payload,
                 onPacket: frame =>
                 {
-                    Logger?.LogDebug("RX from {From:X8} to {To:X8}, {Len} bytes", frame.From, frame.To,
+                    Logger?.LogTrace("RX from {From:X8} to {To:X8}, {Len} bytes", frame.From, frame.To,
                         frame.Payload.Length);
                     try
                     {
