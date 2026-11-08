@@ -38,7 +38,8 @@ public sealed class MeshatasticTransport : ITransport
     private bool _started;
 
     public MeshatasticTransport(MeshatasticTransportOptions options, ILogger? logger = null)
-        : this(options, new MeshtasticSerialLink(options.ComPort, options.BaudRate, logger), ownsLink: true, logger)
+        : this(options, MeshtasticGate.Instance.CreateLink(options.ComPort, options.BaudRate, logger),
+            ownsLink: true, logger)
     {
     }
 

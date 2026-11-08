@@ -1,0 +1,337 @@
+using System.IO;
+using System.IO.Ports;
+using Microsoft.Extensions.Logging;
+
+namespace ShortP2P.LoRa.Link;
+
+/// <summary>
+///     Single-threaded serial engine for ONE Meshtastic board session (REQ-GATE-2).
+///     Every member must be called from the gate radio thread; calls from any other thread throw
+///     <see cref="InvalidOperationException" />. No locks are needed: the radio thread is the sole owner
+///     of the <see cref="SerialPort" />, the node database and the parser buffer.
+/// </summary>
+internal sealed class MeshtasticSerialSession
+{
+    private const int AnnounceRetrySeconds = 1;
+    private const int RefreshRetrySeconds = 2;
+
+    private readonly string _portName;
+    private readonly int _baudRate;
+    private readonly Thread _owner;
+    private readonly List<byte> _pending = new(MeshtasticProto.MaxPacketBytes * 2);
+    private readonly Dictionary<uint, MeshtasticRadioNode> _nodes = new();
+    private readonly byte[] _readBuffer = new byte[4096];
+    private long _packetId;
+
+    private SerialPort? _port;
+    private TaskCompletionSource<bool>? _refreshWait;
+    private uint _refreshWaitId;
+    private uint _localNodeNumber;
+    private bool _hasLocalNode;
+    private DateTime _nextAnnounceRetryUtc = DateTime.MaxValue;
+    private DateTime _nextRefreshRetryUtc = DateTime.MaxValue;
+
+    /// <summary>Raw board frames (raised on the radio thread).</summary>
+    internal event Action<MeshLinkFrame>? Received;
+
+    /// <summary>Raised once when the board reports its local node number.</summary>
+    internal event Action? NodeNumberAnnounced;
+
+    internal MeshtasticSerialSession(string portName, int baudRate, Thread owner, ILogger? logger)
+    {
+        _portName = portName;
+        _baudRate = baudRate;
+        _owner = owner;
+        Logger = logger;
+        _packetId = Random.Shared.Next(1, int.MaxValue);
+    }
+
+    internal ILogger? Logger { get; }
+
+    internal uint? LocalNodeNumber => _hasLocalNode ? _localNodeNumber : null;
+
+    /// <summary>Open the port and ask the board for its config (it reports my_info → node number).</summary>
+    internal void Open()
+    {
+        EnsureOwner();
+        if (_port != null)
+            return;
+
+        var port = new SerialPort(_portName, _baudRate, Parity.None, 8, StopBits.One)
+        {
+            ReadTimeout = 500,
+            WriteTimeout = 5000,
+            DtrEnable = true,
+            RtsEnable = true
+        };
+        port.Open();
+        _port = port;
+
+        // The board may reset on the DTR edge and miss this frame while booting;
+        // Pump retries the want_config until the board reports my_info.
+        WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(1)));
+        _nextAnnounceRetryUtc = DateTime.UtcNow.AddSeconds(AnnounceRetrySeconds);
+        Logger?.LogInformation("Meshtastic serial session opened on {Port} at {Baud}", _portName, _baudRate);
+    }
+
+    internal void Close()
+    {
+        EnsureOwner();
+        var port = _port;
+        _port = null;
+        _refreshWait?.TrySetCanceled();
+        _refreshWait = null;
+        _nextAnnounceRetryUtc = DateTime.MaxValue;
+        _nextRefreshRetryUtc = DateTime.MaxValue;
+        _pending.Clear();
+        if (port == null)
+            return;
+
+        try
+        {
+            if (port.IsOpen)
+                port.Close();
+        }
+        finally
+        {
+            port.Dispose();
+        }
+
+        Logger?.LogInformation("Meshtastic serial session on {Port} stopped", _portName);
+    }
+
+    internal void Send(uint to, ReadOnlyMemory<byte> payload)
+    {
+        EnsureOwner();
+        if (_port is not { IsOpen: true })
+            throw new IOException("Serial port is closed.");
+
+        var framed = MeshtasticProto.Frame(
+            MeshtasticProto.BuildToRadioPacket(to, NextPacketId(), payload.ToArray(), hopLimit: 3));
+        WriteRaw(framed);
+    }
+
+    /// <summary>
+    ///     Ask the board to resend its node database; the wait completes on config_complete
+    /// (raised by <see cref="Pump" /> when the board answers with the same config id).
+    /// </summary>
+    internal void BeginRefresh(TaskCompletionSource<bool> refresh)
+    {
+        EnsureOwner();
+        if (_port is not { IsOpen: true })
+        {
+            refresh.TrySetResult(false);
+            return;
+        }
+
+        _nodes.Clear();
+        var id = (uint)Random.Shared.Next(2, int.MaxValue);
+        _refreshWaitId = id;
+        _refreshWait = refresh;
+        _nextRefreshRetryUtc = DateTime.UtcNow.AddSeconds(RefreshRetrySeconds);
+        WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(id)));
+    }
+
+    /// <summary>
+    ///     Drain buffered board bytes, parse frames, update the node database and raise events.
+    ///     Returns true when the device state changed (caller should republish the snapshot).
+    /// </summary>
+    internal bool Pump()
+    {
+        EnsureOwner();
+        if (_port is not { IsOpen: true })
+            return false;
+
+        RetryDueWants();
+
+        int available;
+        try
+        {
+            available = _port.BytesToRead;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            return false;
+        }
+
+        if (available <= 0)
+            return false;
+
+        int read;
+        try
+        {
+            read = _port.Read(_readBuffer, 0, Math.Min(available, _readBuffer.Length));
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or TimeoutException)
+        {
+            return false;
+        }
+
+        if (read <= 0)
+            return false;
+
+        for (var i = 0; i < read; i++)
+            _pending.Add(_readBuffer[i]);
+        return DrainFrames();
+    }
+
+    internal IReadOnlyList<MeshtasticRadioNode> SnapshotNodes()
+    {
+        EnsureOwner();
+        return _nodes.Values.ToArray();
+    }
+
+    // ---- radio-thread internals ----
+
+    /// <summary>
+    ///     Re-send pending want_config frames until the board answers: boards that reset on the DTR
+    ///     edge miss the first frame sent milliseconds after open while the firmware is still booting.
+    /// </summary>
+    private void RetryDueWants()
+    {
+        var now = DateTime.UtcNow;
+        if (!_hasLocalNode && now >= _nextAnnounceRetryUtc)
+        {
+            try
+            {
+                WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(1)));
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Retrying the announce want_config failed");
+                return;
+            }
+
+            _nextAnnounceRetryUtc = now.AddSeconds(AnnounceRetrySeconds);
+        }
+
+        if (_refreshWait != null && now >= _nextRefreshRetryUtc)
+        {
+            try
+            {
+                WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(_refreshWaitId)));
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Retrying the node database want_config failed");
+                return;
+            }
+
+            _nextRefreshRetryUtc = now.AddSeconds(RefreshRetrySeconds);
+        }
+    }
+
+    private void WriteRaw(byte[] framed)
+    {
+        var port = _port;
+        if (port is not { IsOpen: true })
+            throw new IOException("Serial port is closed.");
+        port.Write(framed, 0, framed.Length);
+    }
+
+    private uint NextPacketId()
+    {
+        return (uint)(unchecked(++_packetId) & int.MaxValue);
+    }
+
+    private bool DrainFrames()
+    {
+        var changed = false;
+        while (true)
+        {
+            var start = -1;
+            for (var i = 0; i + 1 < _pending.Count; i++)
+                if (_pending[i] == MeshtasticProto.Start1 && _pending[i + 1] == MeshtasticProto.Start2)
+                {
+                    start = i;
+                    break;
+                }
+
+            if (start < 0)
+            {
+                _pending.Clear();
+                return changed;
+            }
+
+            if (start > 0)
+                _pending.RemoveRange(0, start);
+
+            if (_pending.Count < 4)
+                return changed;
+
+            var length = (_pending[2] << 8) | _pending[3];
+            if (length > MeshtasticProto.MaxPacketBytes)
+            {
+                _pending.RemoveRange(0, 2); // resync
+                continue;
+            }
+
+            if (_pending.Count < 4 + length)
+                return changed;
+
+            var payload = _pending.GetRange(4, length).ToArray();
+            _pending.RemoveRange(0, 4 + length);
+            changed |= DispatchFromRadio(payload);
+        }
+    }
+
+    private bool DispatchFromRadio(byte[] payload)
+    {
+        try
+        {
+            var changed = false;
+            MeshtasticProto.ReadFromRadio(
+                payload,
+                onPacket: frame =>
+                {
+                    Logger?.LogDebug("RX from {From:X8} to {To:X8}, {Len} bytes", frame.From, frame.To,
+                        frame.Payload.Length);
+                    try
+                    {
+                        Received?.Invoke(frame);
+                    }
+                    catch (Exception ex)
+                    {
+                        // A subscriber must never break the radio thread.
+                        Logger?.LogWarning(ex, "Meshtastic frame subscriber failed");
+                    }
+                },
+                onMyNodeNum: node =>
+                {
+                    _localNodeNumber = node;
+                    if (!_hasLocalNode)
+                    {
+                        _hasLocalNode = true;
+                        Logger?.LogInformation("Board reported local node number {Node:X8}", node);
+                        NodeNumberAnnounced?.Invoke();
+                    }
+
+                    changed = true;
+                },
+                onNode: node =>
+                {
+                    _nodes[node.NodeNumber] = node;
+                    Logger?.LogInformation("Meshtastic node {Id} {Name}", node.NodeId, node.DisplayName);
+                    changed = true;
+                },
+                onConfigComplete: id =>
+                {
+                    if (id == _refreshWaitId)
+                        _refreshWait?.TrySetResult(true);
+                });
+            return changed;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to parse a FromRadio payload ({Len} bytes)", payload.Length);
+            return false;
+        }
+    }
+
+    private void EnsureOwner()
+    {
+        if (Thread.CurrentThread != _owner)
+            throw new InvalidOperationException(
+                "Meshtastic serial session access is forbidden outside the MeshtasticGate radio thread.");
+    }
+}
