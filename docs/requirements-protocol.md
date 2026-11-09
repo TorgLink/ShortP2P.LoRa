@@ -29,16 +29,23 @@ Board **name and model are not part of the config**. The board is already hidden
 ## REQ-CFG-3 — Retry settings
 
 Retry settings live in the same config as the COM port (`MeshatasticTransportOptions` / `RetryConfig`).
+They are stretched by the RX duty-cycle share so ack / next-chunk waits match the channel budget
+(TX 1% / RX 99% by default, REQ-RF-2):
+
+`Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 10 s` and `Nrx = 100 − TX%` (default 99 → **≈ 24.85 s**).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `SendRetryIntervalBase` | **1 s** | Base of the send backoff. |
+| `BaseTimeout` (Tb) | **10 s** | Base wait for a receipt / next chunk before duty scaling. |
+| `RxDutyPercent` (Nrx) | **99** | RX share of the airtime budget (`100 − TX%`). |
+| `RxTimeout` | **Timeout** | No next chunk for this long → ask for resend. |
+| `SendRetryIntervalBase` | **Timeout** | Base of the send backoff. |
 | `SendMaxRetries` | **3** | Send attempts before `SendAsync` fails. Adjustable. |
-| `RxRetryIntervalBase` | **1 s** | Base of the receive-request backoff. |
-| `RxTimeout` | **10 s** | No next chunk for this long → ask for resend. Adjustable. |
+| `RxRetryIntervalBase` | **Timeout** | Base of the receive-request backoff. |
 | `RxMaxRetries` | **3** | Receive-side resend requests before the message is dropped. Adjustable. |
 
-Backoff is exponential: `interval(retry) = base · 2^retry`, so 1 s, 2 s, 4 s on both sides by default.
+Backoff is exponential: `interval(retry) = Timeout · 2^retry`.
+Use `RetryConfig.FromTxDutyPercent(txPercent)` when starting the transport so Tb/Nrx follow the configured duty cycle.
 
 ---
 

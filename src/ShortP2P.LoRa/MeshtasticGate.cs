@@ -283,12 +283,18 @@ public sealed class MeshtasticGate
     {
         if (payload.Length == 0)
             return 50;
+
+        // Chunked 0x01/0x02 start with a letter id (e.g. 0x68), not the ShortP2P frame byte.
+        // Treat the whole chunk train as session/chat so presence cannot slip between parts.
+        if (Chunking.ChunkCodec.LooksLikeChunk(payload))
+            return 0;
+
         return payload[0] switch
         {
-            0x01 or 0x04 or 0x02 => 0, // session setup / route
+            0x01 or 0x04 or 0x02 => 0, // session setup / cipher (single radio frame)
             0x33 => 1, // chunk resend request
             0x31 => 100, // presence keepalive — lowest
-            _ => 10 // cipher / chunks / other
+            _ => 10
         };
     }
 

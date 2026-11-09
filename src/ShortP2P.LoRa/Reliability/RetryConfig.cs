@@ -1,28 +1,110 @@
 namespace ShortP2P.LoRa.Reliability;
 
 /// <summary>
-///     Send-Retry / Receive-Retry settings (REQ-CFG-3). Backoff is exponential:
-///     interval(retry) = base * 2^retry, so 1 s, 2 s, 4 s on defaults.
+///     Send-Retry / Receive-Retry settings (REQ-CFG-3), stretched by the RX duty-cycle share.
+///     Base ack/chunk wait is <see cref="BaseTimeout" /> (Tb = 10 s). Under a TX 1% / RX 99%
+///     budget the peer may need many listen slots before it can TX a receipt or next chunk, so:
+///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 99 → ≈ 24.85 s).
+///     Send/Rx retry interval bases use the same timeout; backoff remains exponential:
+///     <c>interval(retry) = Timeout * 2^retry</c>.
 /// </summary>
 public sealed record RetryConfig
 {
-    public TimeSpan SendRetryIntervalBase { get; init; } = TimeSpan.FromSeconds(1);
+    /// <summary>Tb — base wait for a receipt / next chunk before duty scaling. Default 10 s.</summary>
+    public static readonly TimeSpan DefaultBaseTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>Stretch coefficient in <c>Timeout = Tb * (1 + k * Nrx)</c>.</summary>
+    public const double DefaultDutyStretchPerRxPercent = 0.015;
+
+    /// <summary>Nrx for the product TX 1% / RX 99% profile (REQ-RF-2).</summary>
+    public const double DefaultRxDutyPercent = 99;
+
+    private static readonly TimeSpan DefaultDutyTimeout =
+        ComputeTimeout(DefaultBaseTimeout, DefaultRxDutyPercent);
+
+    /// <summary>Tb — base ack/chunk timeout before duty scaling.</summary>
+    public TimeSpan BaseTimeout { get; init; } = DefaultBaseTimeout;
+
+    /// <summary>
+    ///     Nrx — RX share of the airtime budget in percent (100 − TX%). Default 99.
+    /// </summary>
+    public double RxDutyPercent { get; init; } = DefaultRxDutyPercent;
+
+    /// <summary>k in <c>Timeout = Tb * (1 + k * Nrx)</c>. Default 0.015.</summary>
+    public double DutyStretchPerRxPercent { get; init; } = DefaultDutyStretchPerRxPercent;
+
+    /// <summary>
+    ///     Effective ack / next-chunk wait after duty scaling.
+    ///     Defaults to <see cref="ComputeTimeout" />; set explicitly to override (tests).
+    /// </summary>
+    public TimeSpan RxTimeout { get; init; } = DefaultDutyTimeout;
+
+    /// <summary>Base of the send backoff (defaults to the duty-scaled timeout).</summary>
+    public TimeSpan SendRetryIntervalBase { get; init; } = DefaultDutyTimeout;
 
     /// <summary>Send attempts before <c>SendAsync</c> fails. Default 3.</summary>
     public int SendMaxRetries { get; init; } = 3;
 
-    public TimeSpan RxRetryIntervalBase { get; init; } = TimeSpan.FromSeconds(1);
-
-    /// <summary>
-    ///     No next chunk for this long → ask the sender to resend. Default 180 s: under the 1%
-    ///     duty-cycle budget a multi-chunk datagram can sit between radio frames for well over
-    ///     half a minute (presence/keepalive and other chat share the same airtime window), so a
-    ///     30 s timeout falsely aborts reassembly and floods 0x33 resends.
-    /// </summary>
-    public TimeSpan RxTimeout { get; init; } = TimeSpan.FromSeconds(180);
+    /// <summary>Base of the receive-request backoff (defaults to the duty-scaled timeout).</summary>
+    public TimeSpan RxRetryIntervalBase { get; init; } = DefaultDutyTimeout;
 
     /// <summary>Receive-side resend requests before the message is dropped. Default 3.</summary>
     public int RxMaxRetries { get; init; } = 3;
+
+    /// <summary>
+    ///     <c>Timeout = Tb * (1 + stretch * Nrx)</c>.
+    ///     Example: Tb=10 s, Nrx=99 → 10 * (1 + 1.485) = 24.85 s.
+    /// </summary>
+    public static TimeSpan ComputeTimeout(
+        TimeSpan baseTimeout,
+        double rxDutyPercent,
+        double stretchPerRxPercent = DefaultDutyStretchPerRxPercent)
+    {
+        if (baseTimeout < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(baseTimeout));
+        if (rxDutyPercent is < 0 or > 100)
+            throw new ArgumentOutOfRangeException(nameof(rxDutyPercent));
+        if (stretchPerRxPercent < 0)
+            throw new ArgumentOutOfRangeException(nameof(stretchPerRxPercent));
+
+        var factor = 1.0 + stretchPerRxPercent * rxDutyPercent;
+        return TimeSpan.FromMilliseconds(baseTimeout.TotalMilliseconds * factor);
+    }
+
+    /// <summary>Nrx = clamp(100 − TX%, 0..100).</summary>
+    public static double RxPercentFromTxDuty(double txDutyPercent) =>
+        Math.Clamp(100.0 - txDutyPercent, 0, 100);
+
+    /// <summary>
+    ///     Build retry settings from the configured TX duty-cycle percent so timeouts follow the
+    ///     channel budget (Tb=10 s unless overridden).
+    /// </summary>
+    public static RetryConfig FromTxDutyPercent(double txDutyPercent, TimeSpan? baseTimeout = null)
+    {
+        var tb = baseTimeout ?? DefaultBaseTimeout;
+        var nrx = RxPercentFromTxDuty(txDutyPercent);
+        var timeout = ComputeTimeout(tb, nrx);
+        return new RetryConfig
+        {
+            BaseTimeout = tb,
+            RxDutyPercent = nrx,
+            RxTimeout = timeout,
+            SendRetryIntervalBase = timeout,
+            RxRetryIntervalBase = timeout
+        };
+    }
+
+    /// <summary>Recompute <see cref="RxTimeout" /> / retry bases from current Tb and Nrx.</summary>
+    public RetryConfig WithDutyScaledTimeouts()
+    {
+        var timeout = ComputeTimeout(BaseTimeout, RxDutyPercent, DutyStretchPerRxPercent);
+        return this with
+        {
+            RxTimeout = timeout,
+            SendRetryIntervalBase = timeout,
+            RxRetryIntervalBase = timeout
+        };
+    }
 
     public TimeSpan SendDelay(int retry)
     {

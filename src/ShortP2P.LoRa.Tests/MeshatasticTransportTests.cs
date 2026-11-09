@@ -291,10 +291,29 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Backoff_Is_Exponential()
     {
-        var cfg = new RetryConfig();
+        var cfg = new RetryConfig
+        {
+            SendRetryIntervalBase = TimeSpan.FromSeconds(1),
+            RxRetryIntervalBase = TimeSpan.FromSeconds(1)
+        };
         Assert.Equal(TimeSpan.FromSeconds(1), cfg.SendDelay(0));
         Assert.Equal(TimeSpan.FromSeconds(4), cfg.SendDelay(2));
         Assert.Equal(TimeSpan.FromSeconds(2), cfg.RxDelay(1));
+    }
+
+    [Fact]
+    public void RetryConfig_Duty_Scaled_Timeout_Matches_Formula()
+    {
+        // Timeout = Tb * (1 + 0.015 * Nrx); Tb=10s, Nrx=99 → 24.85s
+        var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(10), 99);
+        Assert.Equal(TimeSpan.FromSeconds(24.85), timeout);
+
+        var fromDuty = RetryConfig.FromTxDutyPercent(1.0);
+        Assert.Equal(99, fromDuty.RxDutyPercent);
+        Assert.Equal(timeout, fromDuty.RxTimeout);
+        Assert.Equal(timeout, fromDuty.SendRetryIntervalBase);
+        Assert.Equal(timeout, fromDuty.SendDelay(0));
+        Assert.Equal(TimeSpan.FromSeconds(49.7), fromDuty.SendDelay(1));
     }
 
     [Fact]
