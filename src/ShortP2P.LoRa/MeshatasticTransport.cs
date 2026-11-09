@@ -678,7 +678,9 @@ public sealed class MeshatasticTransport : ITransport
                 // Control / short / medium text: duty-scaled RxTimeout (~141 s).
                 // Large text / binary (est. ≥ 1000 B, TX priorities 4–6): LargePayloadTimeout (180 s).
                 var retryCfg = _options.Retry;
-                foreach (var stalled in _reassembler.GetStalled(now, size => retryCfg.ChunkTimeoutForEstimatedSize(size)))
+                foreach (var stalled in _reassembler.GetStalled(now,
+                             (size, missing, received) =>
+                                 retryCfg.ChunkTimeoutForProgress(size, missing, received)))
                 {
                     if (!stalled.From.TryToNodeNumber(out var fromNode))
                     {

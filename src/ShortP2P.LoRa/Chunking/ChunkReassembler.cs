@@ -116,15 +116,24 @@ public sealed class ChunkReassembler
     ///     Size estimate = received bytes + missingChunks × max observed chunk data length.
     /// </summary>
     public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
-        DateTime utcNow, Func<int, TimeSpan> timeoutForSize)
+        DateTime utcNow, Func<int, TimeSpan> timeoutForSize) =>
+        GetStalled(utcNow, (estimated, missing, received) => timeoutForSize(estimated));
+
+    /// <summary>
+    ///     Assemblies that saw no new chunk for the timeout selected from size and completeness.
+    ///     <paramref name="timeoutForProgress"/> receives (estimatedBytes, missingChunks, receivedChunks).
+    /// </summary>
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
+        DateTime utcNow, Func<int, int, int, TimeSpan> timeoutForProgress)
     {
-        ArgumentNullException.ThrowIfNull(timeoutForSize);
+        ArgumentNullException.ThrowIfNull(timeoutForProgress);
 
         var result = new List<(MeshId, string, int, DateTime)>();
         foreach (var (key, state) in _states)
         {
             var estimated = EstimateBytes(state);
-            var timeout = timeoutForSize(estimated);
+            var missing = state.Total - state.Chunks.Count;
+            var timeout = timeoutForProgress(estimated, missing, state.Chunks.Count);
             if (utcNow - state.LastChunkUtc < timeout)
                 continue;
 

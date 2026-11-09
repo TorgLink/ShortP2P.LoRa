@@ -96,4 +96,23 @@ public class ChunkReassemblerTests
         Assert.Single(stalled);
         Assert.Equal("Lg0001", stalled[0].Id);
     }
+
+    [Fact]
+    public void Stalled_Partial_Assembly_Uses_Progress_Timeout()
+    {
+        var r = new ChunkReassembler();
+        var t0 = DateTime.UtcNow;
+        // Last chunk of 2 arrived; first is missing — accelerate resend vs full RxTimeout.
+        r.Add(From, MakeChunk("BEHDiT", 2, 2, 0x1111, new byte[60]), t0, out _);
+
+        TimeSpan Progress(int estimated, int missing, int received) =>
+            missing > 0 && received > 0
+                ? TimeSpan.FromSeconds(45)
+                : TimeSpan.FromSeconds(141);
+
+        Assert.Empty(r.GetStalled(t0 + TimeSpan.FromSeconds(40), Progress));
+        var stalled = r.GetStalled(t0 + TimeSpan.FromSeconds(46), Progress);
+        Assert.Single(stalled);
+        Assert.Equal("BEHDiT", stalled[0].Id);
+    }
 }
