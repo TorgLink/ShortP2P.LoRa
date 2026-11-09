@@ -29,12 +29,14 @@ public sealed class MeshatasticTransport : ITransport
     private readonly Channel<TransportReceiveMessage> _channel = Channel.CreateUnbounded<TransportReceiveMessage>();
     private readonly ChunkReassembler _reassembler = new();
     private readonly SemaphoreSlim _txWindow = new(1, 1);
+    private readonly MeshtasticTxPriorityQueues _txQueues = new();
     private readonly ConcurrentDictionary<string, OutboxEntry> _outbox = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, int> _resendCounts = new(StringComparer.Ordinal);
 
     private CancellationTokenSource? _cts;
     private Task? _sweepTask;
     private int _snapshotPending;
+    private int _txPumpRunning;
     private bool _started;
 
     public MeshatasticTransport(MeshatasticTransportOptions options, ILogger? logger = null)
@@ -136,8 +138,16 @@ public sealed class MeshatasticTransport : ITransport
     ///     Destination kind must be 5 (one MeshId; 0xFFFFFFFF = broadcast).
     ///     Large datagrams are chunked with CRC; chunks are retried per Send-Retry.
     /// </remarks>
+    public ValueTask SendAsync(ReadOnlyMemory<byte> payload, TransportAddress destination,
+        CancellationToken cancellationToken = default) =>
+        SendAsync(payload, destination, contentKind: null, cancellationToken);
+
+    /// <summary>
+    ///     Same as <see cref="SendAsync(ReadOnlyMemory{byte},TransportAddress,CancellationToken)" /> with an
+    ///     optional content-class hint for cipher (0x02) priority (text vs binary size bands).
+    /// </summary>
     public async ValueTask SendAsync(ReadOnlyMemory<byte> payload, TransportAddress destination,
-        CancellationToken cancellationToken = default)
+        MeshtasticTxContentKind? contentKind, CancellationToken cancellationToken = default)
     {
         if (!_started)
             throw new InvalidOperationException("Transport is not started.");
@@ -152,7 +162,7 @@ public sealed class MeshatasticTransport : ITransport
         if (!meshId.TryToNodeNumber(out var node))
             throw new ArgumentException("Only 4-byte (node number) MeshIds are supported by this link.", nameof(destination));
 
-        await SendDatagramAsync(node, payload, cancellationToken).ConfigureAwait(false);
+        await SendDatagramAsync(node, payload, contentKind, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Host hook: after the sender of a cipher frame is known, bind it (REQ-DIR-3, step 4).</summary>
@@ -178,9 +188,16 @@ public sealed class MeshatasticTransport : ITransport
     public event Action<uint, uint, byte[]>? PresenceReceived;
 
     /// <summary>Send one already-framed datagram (presence 0x31, directory, retry). Not a chat frame.</summary>
-    public Task SendOpaqueAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    public Task SendOpaqueAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default) =>
+        SendOpaqueAsync(node, payload, contentKind: null, cancellationToken);
+
+    /// <summary>
+    ///     Opaque send with optional content-class hint (used when the frame is not control/signaling).
+    /// </summary>
+    public Task SendOpaqueAsync(uint node, ReadOnlyMemory<byte> payload, MeshtasticTxContentKind? contentKind,
+        CancellationToken cancellationToken = default)
     {
-        return SendDatagramAsync(node, payload, cancellationToken);
+        return SendDatagramAsync(node, payload, contentKind, cancellationToken);
     }
 
     /// <summary>Broadcast the directory so other TorgLink radios can answer a scan.</summary>
@@ -190,57 +207,128 @@ public sealed class MeshatasticTransport : ITransport
         if (!_started || localId == null)
             return;
         var snapshot = MeshDirectorySnapshotCodec.Encode(localId, Directory.Snapshot());
-        await SendDatagramAsync(BroadcastNode, snapshot, cancellationToken).ConfigureAwait(false);
+        await SendDatagramAsync(BroadcastNode, snapshot, contentKind: null, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     // ---- datagram send path ----
 
-    private void EnsureTxAllowed()
+    /// <summary>
+    ///     Enqueue a datagram on the priority TX queues (REQ-TX-PRIO-1). A single pump drains
+    ///     higher priorities first; each dequeued datagram still holds <see cref="_txWindow" />
+    ///     for all of its radio frames so chunk trains are not interleaved.
+    /// </summary>
+    private Task SendDatagramAsync(uint node, ReadOnlyMemory<byte> payload,
+        MeshtasticTxContentKind? contentKind, CancellationToken cancellationToken)
     {
-        if (_options.Jurisdiction.IsUnset)
-            throw new InvalidOperationException(
-                "Region is UNSET: no TX until a jurisdiction profile is chosen (REQ-RF-2).");
+        if (payload.Length == 0)
+            throw new ArgumentException("Payload is empty.", nameof(payload));
+
+        var priority = MeshtasticTxClassifier.Classify(payload.Span, contentKind);
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var item = new MeshtasticTxWorkItem(node, payload.ToArray(), priority, done, cancellationToken);
+        if (cancellationToken.CanBeCanceled)
+        {
+            cancellationToken.Register(static state =>
+            {
+                var tcs = (TaskCompletionSource<bool>)state!;
+                tcs.TrySetCanceled();
+            }, done);
+        }
+
+        _txQueues.Enqueue(item);
+        _logger?.LogTrace(
+            "LoRa TX queued priority {Priority} frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8}",
+            (int)priority, payload.Span[0], payload.Length, node);
+        EnsureTxPump();
+        return done.Task;
     }
 
-    private async Task SendDatagramAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+    private void EnsureTxPump()
+    {
+        if (Interlocked.CompareExchange(ref _txPumpRunning, 1, 0) != 0)
+            return;
+        _ = Task.Run(PumpTxQueuesAsync);
+    }
+
+    private async Task PumpTxQueuesAsync()
+    {
+        try
+        {
+            while (_txQueues.TryDequeue(out var item))
+            {
+                if (item.Completion.Task.IsCompleted)
+                    continue;
+                if (item.CancellationToken.IsCancellationRequested)
+                {
+                    item.Completion.TrySetCanceled(item.CancellationToken);
+                    continue;
+                }
+
+                try
+                {
+                    await SendDatagramNowAsync(item.Node, item.Datagram, item.CancellationToken)
+                        .ConfigureAwait(false);
+                    item.Completion.TrySetResult(true);
+                }
+                catch (OperationCanceledException oce)
+                {
+                    item.Completion.TrySetCanceled(oce.CancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    item.Completion.TrySetException(ex);
+                }
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _txPumpRunning, 0);
+            // A concurrent Enqueue may have raced after the last TryDequeue returned false.
+            if (!_txQueues.IsEmpty)
+                EnsureTxPump();
+        }
+    }
+
+    private async Task SendDatagramNowAsync(uint node, byte[] payload, CancellationToken cancellationToken)
     {
         await _txWindow.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var first = payload.Length > 0 ? payload.Span[0] : (byte)0;
+            var first = payload.Length > 0 ? payload[0] : (byte)0;
             if (payload.Length <= _options.MaxRadioPayloadBytes)
             {
                 _logger?.LogTrace(
                     "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} (single radio frame): {Hex}",
-                    first, payload.Length, node, Convert.ToHexString(payload.Span));
+                    first, payload.Length, node, Convert.ToHexString(payload));
                 await SendFrameWithRetryAsync(node, payload, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             var id = ChunkCodec.NewId();
-            var crc = Crc32.Compute(payload.Span);
+            var crc = Crc32.Compute(payload);
             var chunkDataSize = _options.MaxRadioPayloadBytes - ChunkCodec.HeaderLength;
             var total = (ushort)((payload.Length + chunkDataSize - 1) / chunkDataSize);
             var frame = new byte[_options.MaxRadioPayloadBytes];
 
             _logger?.LogTrace(
                 "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id}): {Hex}",
-                first, payload.Length, node, total, id, Convert.ToHexString(payload.Span));
+                first, payload.Length, node, total, id, Convert.ToHexString(payload));
 
-            // Burst chunks back-to-back while holding the TX window so presence cannot interleave
-            // mid-datagram (duty-cycle deferral still applies per frame inside the gate).
+            // Burst chunks back-to-back while holding the TX window so lower-priority work cannot
+            // interleave mid-datagram (duty-cycle deferral still applies per frame inside the gate).
             for (ushort number = 1; number <= total; number++)
             {
                 var offset = (number - 1) * chunkDataSize;
                 var take = Math.Min(chunkDataSize, payload.Length - offset);
-                var written = ChunkCodec.WriteChunk(frame, id, number, total, crc, payload.Span.Slice(offset, take));
+                var written = ChunkCodec.WriteChunk(frame, id, number, total, crc, payload.AsSpan(offset, take));
                 _logger?.LogTrace(
                     "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}: {Hex}",
                     number, total, written, id, node, Convert.ToHexString(frame.AsSpan(0, written)));
                 await SendFrameWithRetryAsync(node, frame.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
             }
 
-            _outbox[OutboxKey(node, id)] = new OutboxEntry(payload.ToArray(), node, DateTime.UtcNow);
+            _outbox[OutboxKey(node, id)] = new OutboxEntry(payload, node, DateTime.UtcNow);
         }
         finally
         {
@@ -400,7 +488,8 @@ public sealed class MeshatasticTransport : ITransport
             var request = RetryRequestCodec.Encode(MeshId.FromNodeNumber(fromNode), compressedId, reason, (byte)count);
             try
             {
-                await SendDatagramAsync(fromNode, request, CancellationToken.None).ConfigureAwait(false);
+                await SendDatagramAsync(fromNode, request, contentKind: null, CancellationToken.None)
+                    .ConfigureAwait(false);
                 _logger?.LogInformation("Asked {From:X8} to resend {Id} (reason {Reason}, retry {Retry})", fromNode,
                     compressedId, reason, count);
             }
@@ -439,7 +528,8 @@ public sealed class MeshatasticTransport : ITransport
         {
             try
             {
-                await SendDatagramAsync(fromNode, entry.Datagram, CancellationToken.None).ConfigureAwait(false);
+                await SendDatagramAsync(fromNode, entry.Datagram, contentKind: null, CancellationToken.None)
+                    .ConfigureAwait(false);
                 _logger?.LogInformation("Resent message ({Bytes} bytes) to {To:X8} on request", entry.Datagram.Length,
                     fromNode);
             }
@@ -539,14 +629,16 @@ public sealed class MeshatasticTransport : ITransport
         {
             // No unicast target known: broadcast only our own bindings (REQ-DIR-4).
             var selfSnapshot = MeshDirectorySnapshotCodec.Encode(localId, Directory.GetSelfBindings());
-            await SendDatagramAsync(BroadcastNode, selfSnapshot, CancellationToken.None).ConfigureAwait(false);
+            await SendDatagramAsync(BroadcastNode, selfSnapshot, contentKind: null, CancellationToken.None)
+                .ConfigureAwait(false);
             return;
         }
 
         var payload = MeshDirectorySnapshotCodec.Encode(localId, Directory.Snapshot());
         foreach (var binding in remotes)
             if (new MeshId(binding.MeshId).TryToNodeNumber(out var node))
-                await SendDatagramAsync(node, payload, CancellationToken.None).ConfigureAwait(false);
+                await SendDatagramAsync(node, payload, contentKind: null, CancellationToken.None)
+                    .ConfigureAwait(false);
     }
 
     private async Task PersistDirectoryAsync(CancellationToken cancellationToken)

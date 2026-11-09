@@ -206,6 +206,28 @@ Cleartext frame `0x32` (so the map is usable before a session exists):
 
 A snapshot larger than one radio payload is split into chunks (REQ-CHUNK-1) and gets the same CRC and retry behavior. The component does not deliver `0x32` to the messenger.
 
+## REQ-TX-PRIO-1 — Outbound TX priority queues
+
+Outbound datagrams are classified into six priorities. Each priority has its own FIFO queue.
+The transport TX pump always drains a higher priority before a lower one (1 → 6). An already
+in-flight datagram (including its chunk train) finishes under the single TX window before the
+next queued item starts. Duty-cycle deferral in `MeshtasticGate` still applies per radio frame
+and orders due deferred frames with the same classifier.
+
+| Priority | Class | Rule |
+| --- | --- | --- |
+| 1 | Control / signaling | Invite `0x30`, handshake `0x01`, session setup `0x04`, presence `0x31`, directory `0x32`, retry `0x33`. |
+| 2 | Short text | Text (or default cipher `0x02`) length **≤ 200** bytes (exactly 200 → 2). |
+| 3 | Medium text | Text length **> 200** and **&lt; 1000**. |
+| 4 | Large text | Text length **≥ 1000** (exactly 1000 → 4). |
+| 5 | Small binary | Binary length **≤ 5 KiB** (5120). |
+| 6 | Large binary | Binary length **> 5 KiB**. |
+
+Size is the full datagram length enqueued on the transport. Cipher `0x02` defaults to the text
+bands because ChatWire is encrypted; hosts may pass `MeshtasticTxContentKind.Binary` (image /
+file / transfer) via the `SendAsync` / `SendOpaqueAsync` overloads. Strict priority has no
+anti-starvation round-robin in this revision — continuous control traffic can delay text/binary.
+
 ---
 
 ## Out of scope (here)

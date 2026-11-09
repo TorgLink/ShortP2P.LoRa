@@ -187,8 +187,9 @@ public sealed class MeshtasticGate
     ///     Radio thread only. Sends immediately while the duty-cycle budget allows it; otherwise the
     ///     frame is parked in <see cref="_deferred" /> and fires from the loop when the window slides.
     ///     The radio thread never blocks waiting for airtime.
-    ///     Presence (0x31) never jumps ahead of deferred chat/handshake frames, and is dropped
-    ///     outright when chat is already waiting on the budget — keepalives must not starve 0x01/0x04.
+    ///     Deferred frames are ordered by <see cref="MeshtasticTxClassifier" /> (REQ-TX-PRIO-1):
+    ///     control/presence/discovery before text/binary. Presence that cannot fit the current
+    ///     duty budget is still dropped (keepalive) rather than queued forever.
     /// </summary>
     private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done)
     {
@@ -202,16 +203,6 @@ public sealed class MeshtasticGate
             }
 
             var isPresence = IsPresencePayload(payload);
-            var hasDeferredChat = _deferred.Exists(static d => !IsPresencePayload(d.Payload));
-
-            if (isPresence && hasDeferredChat)
-            {
-                session.Logger?.LogInformation(
-                    "Skipping presence TX while chat/control frames are duty-cycle deferred");
-                done.TrySetResult(true);
-                return;
-            }
-
             var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow);
             if (wait > TimeSpan.Zero)
             {
@@ -231,11 +222,14 @@ public sealed class MeshtasticGate
                 return;
             }
 
-            // Budget allows this frame now, but pending chat must drain before another presence.
-            if (isPresence && _deferred.Count > 0)
+            // Budget allows this frame. If higher-priority work is already deferred, park behind it
+            // so PumpDeferred can drain by MeshtasticTxPriority (control before text/binary).
+            var incomingPriority = MeshtasticTxClassifier.Classify(payload);
+            if (_deferred.Exists(d => MeshtasticTxClassifier.Classify(d.Payload) < incomingPriority))
             {
                 session.Logger?.LogInformation(
-                    "Deferring presence TX behind {Count} pending radio frame(s)", _deferred.Count);
+                    "Deferring TX priority {Priority} behind higher-priority pending radio frame(s)",
+                    (int)incomingPriority);
                 _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done));
                 return;
             }
@@ -269,34 +263,15 @@ public sealed class MeshtasticGate
         if (due == null)
             return;
 
-        // Chat/handshake before presence so keepalives cannot steal the first free airtime slot.
-        due.Sort(static (a, b) => TxPriority(a.Payload).CompareTo(TxPriority(b.Payload)));
+        // REQ-TX-PRIO-1: control/presence before text/binary when several deferred frames are due.
+        due.Sort(static (a, b) =>
+            MeshtasticTxClassifier.Classify(a.Payload).CompareTo(MeshtasticTxClassifier.Classify(b.Payload)));
         foreach (var d in due)
             TryDeliver(d.Token, d.To, d.Payload, d.Done); // may re-defer with a fresh due time
     }
 
     private static bool IsPresencePayload(byte[] payload) =>
         payload.Length > 0 && payload[0] == 0x31;
-
-    /// <summary>Lower value = send sooner when several deferred frames become due together.</summary>
-    private static int TxPriority(byte[] payload)
-    {
-        if (payload.Length == 0)
-            return 50;
-
-        // Chunked 0x01/0x02 start with a letter id (e.g. 0x68), not the ShortP2P frame byte.
-        // Treat the whole chunk train as session/chat so presence cannot slip between parts.
-        if (Chunking.ChunkCodec.LooksLikeChunk(payload))
-            return 0;
-
-        return payload[0] switch
-        {
-            0x01 or 0x04 or 0x02 => 0, // session setup / cipher (single radio frame)
-            0x33 => 1, // chunk resend request
-            0x31 => 100, // presence keepalive — lowest
-            _ => 10
-        };
-    }
 
     internal async Task RefreshAsync(object token, CancellationToken cancellationToken)
     {
