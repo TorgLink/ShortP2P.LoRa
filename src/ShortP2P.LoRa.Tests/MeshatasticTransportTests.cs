@@ -156,7 +156,7 @@ public class MeshatasticTransportTests
         var a = new MeshatasticTransport(options, linkA);
         await a.StartAsync();
 
-        // REQ-RF-2: UNSET no longer blocks TX — the 1% default duty cycle applies instead.
+        // REQ-RF-2: UNSET no longer blocks TX — the 10% default duty cycle applies instead.
         await a.SendAsync(Cipher(), Addr(BobNode));
         Assert.Single(linkA.Sent);
         await a.DisposeAsync();
@@ -304,17 +304,17 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Duty_Scaled_Timeout_Matches_Formula()
     {
-        // Timeout = Tb * (1 + 0.015 * Nrx); Tb=60s, Nrx=99 → 149.1s
-        var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(60), 99);
-        Assert.Equal(TimeSpan.FromSeconds(149.1), timeout);
+        // Timeout = Tb * (1 + 0.015 * Nrx); Tb=60s, Nrx=90 → 141s
+        var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(60), 90);
+        Assert.Equal(TimeSpan.FromSeconds(141), timeout);
 
-        var fromDuty = RetryConfig.FromTxDutyPercent(1.0);
-        Assert.Equal(99, fromDuty.RxDutyPercent);
+        var fromDuty = RetryConfig.FromTxDutyPercent(10.0);
+        Assert.Equal(90, fromDuty.RxDutyPercent);
         Assert.Equal(TimeSpan.FromSeconds(60), fromDuty.BaseTimeout);
         Assert.Equal(timeout, fromDuty.RxTimeout);
         Assert.Equal(timeout, fromDuty.SendRetryIntervalBase);
         Assert.Equal(timeout, fromDuty.SendDelay(0));
-        Assert.Equal(TimeSpan.FromSeconds(298.2), fromDuty.SendDelay(1));
+        Assert.Equal(TimeSpan.FromSeconds(282), fromDuty.SendDelay(1));
     }
 
     [Fact]

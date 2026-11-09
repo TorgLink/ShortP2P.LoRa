@@ -13,7 +13,7 @@ namespace ShortP2P.LoRa;
 ///     single dedicated radio thread. Callers from any thread marshal through the gate command queue;
 ///     device state is published only as immutable <see cref="MeshtasticLinkState" /> snapshots.
 ///     Port access from any other thread is forbidden and enforced by <see cref="MeshtasticSerialSession" />.
-///     The gate also enforces the REQ-RF-2 duty-cycle budget (default TX 1% / RX 99% of estimated airtime
+///     The gate also enforces the REQ-RF-2 duty-cycle budget (default TX 10% / RX 90% of estimated airtime
 ///     over a rolling hour): TX that does not fit the window is deferred, never silently dropped.
 /// </summary>
 public sealed class MeshtasticGate
@@ -27,8 +27,8 @@ public sealed class MeshtasticGate
     /// <summary>The only gate instance in the process.</summary>
     public static MeshtasticGate Instance => InstanceField;
 
-    /// <summary>REQ-RF-2 default product duty cycle: TX 1% / RX 99% of estimated airtime.</summary>
-    public const double DefaultDutyCyclePercent = 1.0;
+    /// <summary>REQ-RF-2 default product duty cycle: TX 10% (Ntx) / RX 90% (Nrx) of estimated airtime.</summary>
+    public const double DefaultDutyCyclePercent = 10.0;
 
     /// <summary>ToRadio protobuf overhead on top of the payload, for the airtime estimate.</summary>
     private const int RadioOverheadBytes = 16;
@@ -83,7 +83,7 @@ public sealed class MeshtasticGate
     /// <summary>
     ///     REQ-RF-2 policy applied on the radio thread: TX ≤ <paramref name="dutyCyclePercent" /> of
     ///     estimated on-air time over a rolling one-hour window (Meshtastic EU semantics), remainder RX.
-    ///     The host clamps the default 1% to the selected region cap and applies this before starting
+    ///     The host clamps the default 10% to the selected region cap and applies this before starting
     ///     the transport. Replacing the budget resets the window accounting.
     /// </summary>
     public Task ConfigureDutyCycleAsync(double dutyCyclePercent, double airtimePerByteMs,

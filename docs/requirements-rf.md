@@ -32,13 +32,13 @@ Until the user or a country/region profile overrides:
 
 | Parameter | Default |
 | --- | --- |
-| TX duty cycle | **1%** |
-| RX / listen | **99%** (complement of TX duty cycle) |
-| Region | `UNSET` → TX allowed at the **1% default duty cycle** (no hard ban; the region cap applies when a region is chosen) |
+| TX duty cycle | **10%** (Ntx) |
+| RX / listen | **90%** (Nrx; complement of TX duty cycle) |
+| Region | `UNSET` → TX allowed at the **10% default duty cycle** (no hard ban; the region cap applies when a region is chosen) |
 | TX power | Region max, or hardware-safe default when the stack treats `0` as max legal continuous power |
 | Frequency | Center / frequency slot of the selected region band (Meshtastic slot rules are acceptable) |
 
-Rationale: listen-mostly mesh. Product default TX 1% is at or below most regulatory caps (for example EU 10%).
+Rationale: listen-mostly mesh. Product default TX 10% / RX 90% matches a typical EU regional duty-cycle cap while keeping most airtime for RX.
 
 ---
 
@@ -61,7 +61,7 @@ Rationale: listen-mostly mesh. Product default TX 1% is at or below most regulat
    - The setting is applied.
    - Config / status keeps a visible **override / at-own-risk** flag while the value stays above the norm or until override is cleared.
    - Legal compliance of TX remains the operator’s responsibility (documented disclaimer).
-5. Product **default**: TX **1%** / RX **99%**, power ≤ region max, frequency inside the band, override **off**.
+5. Product **default**: TX **10%** / RX **90%**, power ≤ region max, frequency inside the band, override **off**.
 6. There is no hidden `min(configured, regionMax)` apply path: either the value is within the norm, or a confirmed override is active.
 
 ---
@@ -119,7 +119,7 @@ Country selection applies one or more allowed Meshtastic regions from [region-by
 After a country is chosen:
 
 1. Primary region = preferred band for that country (configurable preference, e.g. prefer 868 over 433 for EU where both exist).
-2. **TX duty cycle remains 1%** unless the region max is lower than 1% (then clamp to region max without override).
+2. **TX duty cycle remains 10%** unless the region max is lower than 10% (then clamp to region max without override).
 3. TX power defaults to the region max (user may lower it).
 4. Frequency stays within that region band.
 
@@ -152,8 +152,8 @@ Representative mapping (full table = Meshtastic region-by-country):
 
 ## REQ-RF-6 — Acceptance (RF)
 
-1. Fresh install / `UNSET` region: TX limited to the **1% default duty cycle** (no hard ban).
-2. After defaults apply: measured TX airtime ≤ **1%** over the enforcement window; otherwise RX / listen.
+1. Fresh install / `UNSET` region: TX limited to the **10% default duty cycle** (no hard ban).
+2. After defaults apply: measured TX airtime ≤ **10%** over the enforcement window; otherwise RX / listen.
 3. Country profile: frequency, power, and duty cycle never exceed region caps **without** a confirmed override.
 4. Attempt to set `dutyCycle > regionMax`, `power > regionMax`, or frequency outside the band:
    - blocked until confirm;

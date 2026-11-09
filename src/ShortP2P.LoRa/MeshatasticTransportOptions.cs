@@ -16,7 +16,7 @@ public sealed record MeshatasticTransportOptions
 
     public int BaudRate { get; init; } = 115200;
 
-    /// <summary>Selected jurisdiction. Default UNSET — TX is allowed at the 1% default duty cycle (REQ-RF-2).</summary>
+    /// <summary>Selected jurisdiction. Default UNSET — TX is allowed at the 10% default duty cycle (REQ-RF-2).</summary>
     public JurisdictionProfile Jurisdiction { get; init; } = JurisdictionCatalog.Unset;
 
     public RetryConfig Retry { get; init; } = new();
@@ -42,7 +42,7 @@ public sealed record MeshatasticTransportOptions
     /// <summary>
     ///     How long a sent datagram is kept for answering 0x33 resend requests.
     ///     Must cover RxTimeout × (RxMaxRetries+1) under duty scaling
-    ///     (default Timeout≈149.1 s × 4 ≈ 10 min; retention keeps headroom).
+    ///     (default Timeout≈141 s × 4 ≈ 9.4 min; retention keeps headroom).
     /// </summary>
     public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(15);
 

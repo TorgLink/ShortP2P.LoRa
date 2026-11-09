@@ -1,7 +1,7 @@
 namespace ShortP2P.LoRa.Reliability;
 
 /// <summary>
-///     REQ-RF-2 default product profile: TX 1% / RX 99% of estimated on-air time over a rolling
+///     REQ-RF-2 default product profile: TX 10% / RX 90% of estimated on-air time over a rolling
 ///     one-hour window (Meshtastic EU semantics). When the budget is spent, TX defers until the
 ///     window slides; the remainder of the window is RX / listen. Not thread-safe by itself:
 ///     the caller serializes access (the transport TX window).

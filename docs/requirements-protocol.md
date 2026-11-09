@@ -30,14 +30,14 @@ Board **name and model are not part of the config**. The board is already hidden
 
 Retry settings live in the same config as the COM port (`MeshatasticTransportOptions` / `RetryConfig`).
 They are stretched by the RX duty-cycle share so ack / next-chunk waits match the channel budget
-(TX 1% / RX 99% by default, REQ-RF-2):
+(TX 10% / RX 90% by default, REQ-RF-2):
 
-`Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 60 s` and `Nrx = 100 − TX%` (default 99 → **≈ 149.1 s**).
+`Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 60 s` and `Nrx = 100 − TX%` (default 90 → **≈ 141 s**).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `BaseTimeout` (Tb) | **60 s** | Base wait for a receipt / next chunk before duty scaling. |
-| `RxDutyPercent` (Nrx) | **99** | RX share of the airtime budget (`100 − TX%`). |
+| `RxDutyPercent` (Nrx) | **90** | RX share of the airtime budget (`100 − TX%`). |
 | `RxTimeout` | **Timeout** | No next chunk for this long → ask for resend. |
 | `SendRetryIntervalBase` | **Timeout** | Base of the send backoff. |
 | `SendMaxRetries` | **3** | Send attempts before `SendAsync` fails. Adjustable. |

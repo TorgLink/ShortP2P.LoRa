@@ -2,9 +2,9 @@ namespace ShortP2P.LoRa.Reliability;
 
 /// <summary>
 ///     Send-Retry / Receive-Retry settings (REQ-CFG-3), stretched by the RX duty-cycle share.
-///     Base ack/chunk wait is <see cref="BaseTimeout" /> (Tb = 60 s). Under a TX 1% / RX 99%
+///     Base ack/chunk wait is <see cref="BaseTimeout" /> (Tb = 60 s). Under a TX 10% / RX 90%
 ///     budget the peer may need many listen slots before it can TX a receipt or next chunk, so:
-///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 99 → ≈ 149.1 s).
+///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 90 → ≈ 141 s).
 ///     Send/Rx retry interval bases use the same timeout; backoff remains exponential:
 ///     <c>interval(retry) = Timeout * 2^retry</c>.
 /// </summary>
@@ -16,8 +16,8 @@ public sealed record RetryConfig
     /// <summary>Stretch coefficient in <c>Timeout = Tb * (1 + k * Nrx)</c>.</summary>
     public const double DefaultDutyStretchPerRxPercent = 0.015;
 
-    /// <summary>Nrx for the product TX 1% / RX 99% profile (REQ-RF-2).</summary>
-    public const double DefaultRxDutyPercent = 99;
+    /// <summary>Nrx for the product TX 10% / RX 90% profile (REQ-RF-2).</summary>
+    public const double DefaultRxDutyPercent = 90;
 
     private static readonly TimeSpan DefaultDutyTimeout =
         ComputeTimeout(DefaultBaseTimeout, DefaultRxDutyPercent);
@@ -26,7 +26,7 @@ public sealed record RetryConfig
     public TimeSpan BaseTimeout { get; init; } = DefaultBaseTimeout;
 
     /// <summary>
-    ///     Nrx — RX share of the airtime budget in percent (100 − TX%). Default 99.
+    ///     Nrx — RX share of the airtime budget in percent (100 − TX%). Default 90.
     /// </summary>
     public double RxDutyPercent { get; init; } = DefaultRxDutyPercent;
 
@@ -53,7 +53,7 @@ public sealed record RetryConfig
 
     /// <summary>
     ///     <c>Timeout = Tb * (1 + stretch * Nrx)</c>.
-    ///     Example: Tb=60 s, Nrx=99 → 60 * (1 + 1.485) = 149.1 s.
+    ///     Example: Tb=60 s, Nrx=90 → 60 * (1 + 1.35) = 141 s.
     /// </summary>
     public static TimeSpan ComputeTimeout(
         TimeSpan baseTimeout,
@@ -68,7 +68,8 @@ public sealed record RetryConfig
             throw new ArgumentOutOfRangeException(nameof(stretchPerRxPercent));
 
         var factor = 1.0 + stretchPerRxPercent * rxDutyPercent;
-        return TimeSpan.FromMilliseconds(baseTimeout.TotalMilliseconds * factor);
+        // Round to whole ms so duty defaults (e.g. Tb=60s, Nrx=90 → 141s) stay exact in TimeSpan.
+        return TimeSpan.FromMilliseconds(Math.Round(baseTimeout.TotalMilliseconds * factor));
     }
 
     /// <summary>Nrx = clamp(100 − TX%, 0..100).</summary>
