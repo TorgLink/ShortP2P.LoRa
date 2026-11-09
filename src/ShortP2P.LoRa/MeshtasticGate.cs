@@ -225,7 +225,7 @@ public sealed class MeshtasticGate
                 }
 
                 session.Logger?.LogInformation(
-                    "Duty cycle budget spent ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
+                    "Duty cycle pace/limit ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
                     _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
                 _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done));
                 return;
