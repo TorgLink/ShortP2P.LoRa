@@ -105,6 +105,48 @@ public sealed class ChunkReassembler
     }
 
     /// <summary>
+    ///     True when any incomplete assembly received a chunk within <paramref name="freshWindow"/>.
+    ///     Used to pause TX so half-duplex RX can finish a peer chunk train.
+    /// </summary>
+    public bool HasFreshIncomplete(DateTime utcNow, TimeSpan freshWindow)
+    {
+        foreach (var state in _states.Values)
+        {
+            if (state.Chunks.Count >= state.Total)
+                continue;
+            if (utcNow - state.LastChunkUtc <= freshWindow)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     Snapshot of an in-progress assembly: holes in 1..maxReceived, and whether the last
+    ///     chunk number already arrived (common when airtime loss drops mid-train packets).
+    /// </summary>
+    public bool TryGetProgress(MeshId from, string id, out AssemblyProgress progress)
+    {
+        progress = default;
+        if (!_states.TryGetValue(KeyOf(from, id), out var state))
+            return false;
+
+        var missing = state.Total - state.Chunks.Count;
+        var hasGaps = HasGaps(state);
+        var hasLast = state.Chunks.ContainsKey(state.Total);
+        progress = new AssemblyProgress(
+            state.Total,
+            state.Chunks.Count,
+            missing,
+            hasGaps,
+            hasLast,
+            state.LastChunkUtc,
+            state.LastRetryUtc,
+            state.RetryCount);
+        return true;
+    }
+
+    /// <summary>
     ///     Assemblies that saw no new chunk for a fixed <paramref name="timeout" />.
     /// </summary>
     public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
@@ -117,14 +159,24 @@ public sealed class ChunkReassembler
     /// </summary>
     public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
         DateTime utcNow, Func<int, TimeSpan> timeoutForSize) =>
-        GetStalled(utcNow, (estimated, missing, received) => timeoutForSize(estimated));
+        GetStalled(utcNow, (estimated, missing, received, _) => timeoutForSize(estimated));
 
     /// <summary>
     ///     Assemblies that saw no new chunk for the timeout selected from size and completeness.
     ///     <paramref name="timeoutForProgress"/> receives (estimatedBytes, missingChunks, receivedChunks).
     /// </summary>
     public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
-        DateTime utcNow, Func<int, int, int, TimeSpan> timeoutForProgress)
+        DateTime utcNow, Func<int, int, int, TimeSpan> timeoutForProgress) =>
+        GetStalled(utcNow, (estimated, missing, received, _) =>
+            timeoutForProgress(estimated, missing, received));
+
+    /// <summary>
+    ///     Assemblies that saw no new chunk for the timeout selected from size, completeness, and gaps.
+    ///     <paramref name="timeoutForProgress"/> receives
+    ///     (estimatedBytes, missingChunks, receivedChunks, hasGaps).
+    /// </summary>
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
+        DateTime utcNow, Func<int, int, int, bool, TimeSpan> timeoutForProgress)
     {
         ArgumentNullException.ThrowIfNull(timeoutForProgress);
 
@@ -133,7 +185,7 @@ public sealed class ChunkReassembler
         {
             var estimated = EstimateBytes(state);
             var missing = state.Total - state.Chunks.Count;
-            var timeout = timeoutForProgress(estimated, missing, state.Chunks.Count);
+            var timeout = timeoutForProgress(estimated, missing, state.Chunks.Count, HasGaps(state));
             if (utcNow - state.LastChunkUtc < timeout)
                 continue;
 
@@ -145,6 +197,21 @@ public sealed class ChunkReassembler
         return result;
     }
 
+    /// <summary>True when some chunk number ≤ max(received) is missing (mid-train loss).</summary>
+    private static bool HasGaps(State state)
+    {
+        if (state.Chunks.Count == 0)
+            return false;
+        var max = 0;
+        foreach (var n in state.Chunks.Keys)
+        {
+            if (n > max)
+                max = n;
+        }
+
+        return max > state.Chunks.Count;
+    }
+
     private static int EstimateBytes(State state)
     {
         var missing = state.Total - state.Chunks.Count;
@@ -153,6 +220,17 @@ public sealed class ChunkReassembler
         var perChunk = state.MaxChunkDataBytes;
         return state.ReceivedBytes + missing * perChunk;
     }
+
+    /// <summary>Progress of one incomplete (or just-completed) reassembly.</summary>
+    public readonly record struct AssemblyProgress(
+        ushort Total,
+        int Received,
+        int Missing,
+        bool HasGaps,
+        bool HasLastChunk,
+        DateTime LastChunkUtc,
+        DateTime LastRetryUtc,
+        int RetryCount);
 
     /// <summary>
     ///     Marks one Receive-Retry request for this assembly. Returns the new retry count.

@@ -115,4 +115,34 @@ public class ChunkReassemblerTests
         Assert.Single(stalled);
         Assert.Equal("BEHDiT", stalled[0].Id);
     }
+
+    [Fact]
+    public void MidTrain_Holes_Report_Progress_And_Fresh_Incomplete()
+    {
+        var r = new ChunkReassembler();
+        var t0 = DateTime.UtcNow;
+        // Vt3Mi0-style: 1, then 5..7 — holes at 2..4, last present.
+        r.Add(From, MakeChunk("Vt3Mi0", 1, 7, 0xABCD, new byte[60]), t0, out _);
+        Assert.True(r.HasFreshIncomplete(t0 + TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(22)));
+        Assert.False(r.HasFreshIncomplete(t0 + TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(22)));
+
+        r.Add(From, MakeChunk("Vt3Mi0", 5, 7, 0xABCD, new byte[60]), t0.AddSeconds(18), out _);
+        r.Add(From, MakeChunk("Vt3Mi0", 6, 7, 0xABCD, new byte[60]), t0.AddSeconds(28), out _);
+        r.Add(From, MakeChunk("Vt3Mi0", 7, 7, 0xABCD, new byte[40]), t0.AddSeconds(34), out _);
+
+        Assert.True(r.TryGetProgress(From, "Vt3Mi0", out var progress));
+        Assert.Equal(7, progress.Total);
+        Assert.Equal(4, progress.Received);
+        Assert.Equal(3, progress.Missing);
+        Assert.True(progress.HasGaps);
+        Assert.True(progress.HasLastChunk);
+
+        TimeSpan GapProgress(int estimated, int missing, int received, bool hasGaps) =>
+            hasGaps ? TimeSpan.FromSeconds(18) : TimeSpan.FromSeconds(45);
+
+        Assert.Empty(r.GetStalled(t0.AddSeconds(34 + 10), GapProgress));
+        var stalled = r.GetStalled(t0.AddSeconds(34 + 19), GapProgress);
+        Assert.Single(stalled);
+        Assert.Equal("Vt3Mi0", stalled[0].Id);
+    }
 }
