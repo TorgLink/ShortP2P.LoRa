@@ -228,8 +228,8 @@ public sealed class MeshtasticGate
             if (_deferred.Exists(d => MeshtasticTxClassifier.Classify(d.Payload) < incomingPriority))
             {
                 session.Logger?.LogInformation(
-                    "Deferring TX priority {Priority} behind higher-priority pending radio frame(s)",
-                    (int)incomingPriority);
+                    "Deferring TX priority {Priority}-{PriorityName} behind higher-priority pending radio frame(s)",
+                    (int)incomingPriority, incomingPriority);
                 _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done));
                 return;
             }

@@ -238,8 +238,8 @@ public sealed class MeshatasticTransport : ITransport
 
         _txQueues.Enqueue(item);
         _logger?.LogTrace(
-            "LoRa TX queued priority {Priority} frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8}",
-            (int)priority, payload.Span[0], payload.Length, node);
+            "LoRa TX queued priority {Priority}-{PriorityName} frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8}",
+            (int)priority, priority, payload.Span[0], payload.Length, node);
         EnsureTxPump();
         return done.Task;
     }
@@ -257,6 +257,11 @@ public sealed class MeshatasticTransport : ITransport
         {
             while (_txQueues.TryDequeue(out var item))
             {
+                var first = item.Datagram.Length > 0 ? item.Datagram[0] : (byte)0;
+                _logger?.LogTrace(
+                    "LoRa TX dequeued priority {Priority}-{PriorityName} frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8}",
+                    (int)item.Priority, item.Priority, first, item.Datagram.Length, item.Node);
+
                 if (item.Completion.Task.IsCompleted)
                     continue;
                 if (item.CancellationToken.IsCancellationRequested)
@@ -512,7 +517,7 @@ public sealed class MeshatasticTransport : ITransport
         // at the next TX window, with a new compressed id (REQ-RETRY-2).
         OutboxEntry? entry = null;
         foreach (var pair in _outbox)
-            if (pair.Key.EndsWith(":" + id, StringComparison.Ordinal))
+            if (pair.Key.EndsWith($":{id}", StringComparison.Ordinal))
             {
                 entry = pair.Value;
                 break;
