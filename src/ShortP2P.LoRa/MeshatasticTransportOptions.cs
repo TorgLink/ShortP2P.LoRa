@@ -40,11 +40,16 @@ public sealed record MeshatasticTransportOptions
     public TimeSpan RxSweepInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    ///     How long a sent datagram is kept for answering 0x33 resend requests.
-    ///     Must cover the longest chunk wait × (RxMaxRetries+1)
-    ///     (LargePayloadTimeout 180 s × 4 ≈ 12 min; retention keeps headroom).
+    ///     Absolute safety-net TTL from first send for answering 0x33 resend requests.
+    ///     Primary lifetime is event-driven via <see cref="OutboxIdleGrace"/> (activity on serve).
     /// </summary>
-    public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(15);
+    public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(8);
+
+    /// <summary>
+    ///     Drop an outbox entry after this much silence since last send or successful 0x33 serve.
+    ///     Keeps retention short while still covering an active resend exchange.
+    /// </summary>
+    public TimeSpan OutboxIdleGrace { get; init; } = TimeSpan.FromMinutes(3);
 
     internal void Validate()
     {

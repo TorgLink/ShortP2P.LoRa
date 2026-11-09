@@ -64,6 +64,30 @@ public class DirectoryTests
         Assert.Single(all);
         Assert.Equal(Convert.ToHexString(Net(2)), all[0].NetworkIdHex);
         Assert.True(all[0].Confirmed);
+
+        Assert.True(d.TryGetOwnerNetworkId(mesh, out var owner, out var confirmed));
+        Assert.Equal(Net(2), owner);
+        Assert.True(confirmed);
+    }
+
+    [Fact]
+    public void TryGetOwnerNetworkId_Prefers_Confirmed_Binding()
+    {
+        var d = new MeshDirectory();
+        var now = DateTime.UtcNow;
+        var mesh = MeshId.FromNodeNumber(0x01020304);
+
+        d.Remember(Net(1), mesh, MeshSubject.Peer, confirmed: true, now);
+        Assert.True(d.TryGetOwnerNetworkId(mesh, out var owner, out var confirmed));
+        Assert.Equal(Net(1), owner);
+        Assert.True(confirmed);
+
+        // Confirmed move to a different NetworkId (same radio module, new subscriber).
+        d.Remember(Net(9), mesh, MeshSubject.Peer, confirmed: true, now.AddSeconds(1));
+        Assert.True(d.TryGetOwnerNetworkId(mesh, out owner, out confirmed));
+        Assert.Equal(Net(9), owner);
+        Assert.True(confirmed);
+        Assert.Empty(d.GetActiveDestinations(Net(1)));
     }
 
     [Fact]

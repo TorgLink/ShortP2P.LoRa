@@ -71,7 +71,11 @@ public class ChunkReassemblerTests
         Assert.Single(stalled);
         Assert.Equal("sT0001", stalled[0].Id);
 
-        Assert.Equal(1, r.NoteRetry(From, "sT0001"));
+        Assert.Equal(1, r.NoteRetry(From, "sT0001", t0 + TimeSpan.FromSeconds(11)));
+        // NoteRetry must not clear the stall gap — assembly stays stalled until a real chunk arrives.
+        Assert.Single(r.GetStalled(t0 + TimeSpan.FromSeconds(12), TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, r.GetStalled(t0 + TimeSpan.FromSeconds(12), TimeSpan.FromSeconds(10))[0].RetryCount);
+
         r.Drop(From, "sT0001");
         Assert.Empty(r.GetStalled(t0 + TimeSpan.FromHours(1), TimeSpan.FromSeconds(10)));
     }
