@@ -75,4 +75,21 @@ public class ChunkReassemblerTests
         r.Drop(From, "sT0001");
         Assert.Empty(r.GetStalled(t0 + TimeSpan.FromHours(1), TimeSpan.FromSeconds(10)));
     }
+
+    [Fact]
+    public void Stalled_Uses_Size_Based_Timeout_Selector()
+    {
+        var r = new ChunkReassembler();
+        var t0 = DateTime.UtcNow;
+        // One 500-byte chunk of 3 → estimate 500 + 2*500 = 1500 (≥ large band)
+        r.Add(From, MakeChunk("Lg0001", 1, 3, 0xABCD, new byte[500]), t0, out _);
+
+        TimeSpan Selector(int estimated) =>
+            estimated >= 1000 ? TimeSpan.FromSeconds(180) : TimeSpan.FromSeconds(141);
+
+        Assert.Empty(r.GetStalled(t0 + TimeSpan.FromSeconds(150), Selector));
+        var stalled = r.GetStalled(t0 + TimeSpan.FromSeconds(181), Selector);
+        Assert.Single(stalled);
+        Assert.Equal("Lg0001", stalled[0].Id);
+    }
 }

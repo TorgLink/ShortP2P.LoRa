@@ -34,11 +34,17 @@ They are stretched by the RX duty-cycle share so ack / next-chunk waits match th
 
 `Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 60 s` and `Nrx = 100 − TX%` (default 90 → **≈ 141 s**).
 
+Large text and binary chunk assemblies (estimated reassembled size **≥ 1000** bytes, aligning with
+TX priorities 4–6 in REQ-TX-PRIO-1) use a fixed overall next-chunk wait of **180 s**
+(`LargePayloadTimeout`) when that is longer than the duty-scaled `Timeout`. Control / short /
+medium text keep the duty-scaled value.
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `BaseTimeout` (Tb) | **60 s** | Base wait for a receipt / next chunk before duty scaling. |
 | `RxDutyPercent` (Nrx) | **90** | RX share of the airtime budget (`100 − TX%`). |
-| `RxTimeout` | **Timeout** | No next chunk for this long → ask for resend. |
+| `RxTimeout` | **Timeout** | No next chunk for this long → ask for resend (control / short / medium). |
+| `LargePayloadTimeout` | **180 s** | Overall next-chunk wait for large text / binary assemblies (≥ 1000 B). |
 | `SendRetryIntervalBase` | **Timeout** | Base of the send backoff. |
 | `SendMaxRetries` | **3** | Send attempts before `SendAsync` fails. Adjustable. |
 | `RxRetryIntervalBase` | **Timeout** | Base of the receive-request backoff. |
@@ -134,7 +140,7 @@ Every chunk of one datagram carries the same CRC type byte and the same CRC valu
 ## REQ-RX-1 — Receive-Retry
 
 - **CRC disagreement:** a full set whose recomputed CRC does not match, or an incoming chunk whose CRC type / CRC value disagrees with the rest of that datagram — ask the sender to resend after `RxRetryDelay(retry) = RxRetryIntervalBase · 2^retry`. Base default **1 s**. Discard that set.
-- **Stalled assembly:** if for `RxTimeout` after the last received chunk the next one has not come — chunk order does not matter here, and the case "N−1 of N arrived but the last one is missing" is the same stall — send the same resend request with `RxRetryDelay(retry)`. `RxTimeout` default **10 s**, adjustable.
+- **Stalled assembly:** if for the applicable next-chunk wait after the last received chunk the next one has not come — chunk order does not matter here, and the case "N−1 of N arrived but the last one is missing" is the same stall — send the same resend request with `RxRetryDelay(retry)`. Wait is duty-scaled `RxTimeout` (default ≈ **141 s** under TX 10% / RX 90%) for control / short / medium text; large text / binary (estimated size ≥ **1000** B, TX priorities 4–6) use `LargePayloadTimeout` **180 s**. Adjustable.
 - `RxMaxRetries` default **3**, adjustable. After that, the partial message is dropped.
 
 ## REQ-RETRY-2 — Retry request frame `0x33`
@@ -227,6 +233,9 @@ Size is the full datagram length enqueued on the transport. Cipher `0x02` defaul
 bands because ChatWire is encrypted; hosts may pass `MeshtasticTxContentKind.Binary` (image /
 file / transfer) via the `SendAsync` / `SendOpaqueAsync` overloads. Strict priority has no
 anti-starvation round-robin in this revision — continuous control traffic can delay text/binary.
+
+Receive-side chunk stall waits follow the same size cut: assemblies with estimated size ≥ 1000 B
+use `LargePayloadTimeout` (**180 s**); smaller ones keep the duty-scaled `RxTimeout` (REQ-CFG-3).
 
 ---
 

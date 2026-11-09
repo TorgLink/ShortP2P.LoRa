@@ -41,8 +41,8 @@ public sealed record MeshatasticTransportOptions
 
     /// <summary>
     ///     How long a sent datagram is kept for answering 0x33 resend requests.
-    ///     Must cover RxTimeout × (RxMaxRetries+1) under duty scaling
-    ///     (default Timeout≈141 s × 4 ≈ 9.4 min; retention keeps headroom).
+    ///     Must cover the longest chunk wait × (RxMaxRetries+1)
+    ///     (LargePayloadTimeout 180 s × 4 ≈ 12 min; retention keeps headroom).
     /// </summary>
     public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromMinutes(15);
 

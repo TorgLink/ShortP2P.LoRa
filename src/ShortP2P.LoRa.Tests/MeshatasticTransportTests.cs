@@ -52,7 +52,9 @@ public class MeshatasticTransportTests
                 RxRetryIntervalBase = TimeSpan.FromMilliseconds(10),
                 SendMaxRetries = retries,
                 RxMaxRetries = retries,
-                RxTimeout = TimeSpan.FromMilliseconds(300)
+                RxTimeout = TimeSpan.FromMilliseconds(300),
+                // Keep large-payload wait in the same short test band (production default is 180 s).
+                LargePayloadTimeout = TimeSpan.FromMilliseconds(300)
             },
             MaxRadioPayloadBytes = 233
         };
@@ -315,6 +317,19 @@ public class MeshatasticTransportTests
         Assert.Equal(timeout, fromDuty.SendRetryIntervalBase);
         Assert.Equal(timeout, fromDuty.SendDelay(0));
         Assert.Equal(TimeSpan.FromSeconds(282), fromDuty.SendDelay(1));
+        Assert.Equal(TimeSpan.FromSeconds(180), fromDuty.LargePayloadTimeout);
+    }
+
+    [Fact]
+    public void RetryConfig_Large_Payload_Uses_180s_Overall_Chunk_Timeout()
+    {
+        var cfg = RetryConfig.FromTxDutyPercent(10.0);
+        // Control / short / medium (< 1000 B): duty-scaled ≈ 141 s
+        Assert.Equal(cfg.RxTimeout, cfg.ChunkTimeoutForEstimatedSize(200));
+        Assert.Equal(cfg.RxTimeout, cfg.ChunkTimeoutForEstimatedSize(999));
+        // Large text / binary bands (≥ 1000 B, TX priorities 4–6): fixed 180 s
+        Assert.Equal(TimeSpan.FromSeconds(180), cfg.ChunkTimeoutForEstimatedSize(1000));
+        Assert.Equal(TimeSpan.FromSeconds(180), cfg.ChunkTimeoutForEstimatedSize(20 * 1024));
     }
 
     [Fact]

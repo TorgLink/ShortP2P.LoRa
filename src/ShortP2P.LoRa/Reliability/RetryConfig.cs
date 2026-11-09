@@ -7,11 +7,26 @@ namespace ShortP2P.LoRa.Reliability;
 ///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 90 → ≈ 141 s).
 ///     Send/Rx retry interval bases use the same timeout; backoff remains exponential:
 ///     <c>interval(retry) = Timeout * 2^retry</c>.
+///     Large text / binary assemblies (estimated size ≥ <see cref="DefaultLargePayloadMinBytes" />,
+///     aligning with TX priorities 4–6) use a fixed <see cref="LargePayloadTimeout" /> (180 s)
+///     instead of the duty-scaled value when that fixed wait is longer.
 /// </summary>
 public sealed record RetryConfig
 {
     /// <summary>Tb — base wait for a receipt / next chunk before duty scaling. Default 60 s.</summary>
     public static readonly TimeSpan DefaultBaseTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    ///     Overall next-chunk wait for large text / binary reassemblies (TX priorities 4–6).
+    ///     Default 180 s.
+    /// </summary>
+    public static readonly TimeSpan DefaultLargePayloadTimeout = TimeSpan.FromSeconds(180);
+
+    /// <summary>
+    ///     Estimated reassembled size at which <see cref="LargePayloadTimeout" /> applies.
+    ///     Matches the large-text band (≥ 1000 bytes) used by TX priority 4+.
+    /// </summary>
+    public const int DefaultLargePayloadMinBytes = 1000;
 
     /// <summary>Stretch coefficient in <c>Timeout = Tb * (1 + k * Nrx)</c>.</summary>
     public const double DefaultDutyStretchPerRxPercent = 0.015;
@@ -34,10 +49,16 @@ public sealed record RetryConfig
     public double DutyStretchPerRxPercent { get; init; } = DefaultDutyStretchPerRxPercent;
 
     /// <summary>
-    ///     Effective ack / next-chunk wait after duty scaling.
+    ///     Effective ack / next-chunk wait after duty scaling for control / short / medium text.
     ///     Defaults to <see cref="ComputeTimeout" />; set explicitly to override (tests).
     /// </summary>
     public TimeSpan RxTimeout { get; init; } = DefaultDutyTimeout;
+
+    /// <summary>
+    ///     Overall next-chunk wait for large text / binary chunk assemblies (priorities 4–6).
+    ///     Default 180 s; used when longer than <see cref="RxTimeout" />.
+    /// </summary>
+    public TimeSpan LargePayloadTimeout { get; init; } = DefaultLargePayloadTimeout;
 
     /// <summary>Base of the send backoff (defaults to the duty-scaled timeout).</summary>
     public TimeSpan SendRetryIntervalBase { get; init; } = DefaultDutyTimeout;
@@ -105,6 +126,21 @@ public sealed record RetryConfig
             SendRetryIntervalBase = timeout,
             RxRetryIntervalBase = timeout
         };
+    }
+
+    /// <summary>
+    ///     Next-chunk wait for an in-progress reassembly.
+    ///     Estimated size ≥ <paramref name="largeMinBytes" /> (default 1000 → large text / binary
+    ///     bands, TX priorities 4–6) uses <see cref="LargePayloadTimeout" /> when it exceeds the
+    ///     duty-scaled <see cref="RxTimeout" />; smaller assemblies keep <see cref="RxTimeout" />.
+    /// </summary>
+    public TimeSpan ChunkTimeoutForEstimatedSize(
+        int estimatedBytes,
+        int largeMinBytes = DefaultLargePayloadMinBytes)
+    {
+        if (estimatedBytes >= largeMinBytes && LargePayloadTimeout > RxTimeout)
+            return LargePayloadTimeout;
+        return RxTimeout;
     }
 
     public TimeSpan SendDelay(int retry)

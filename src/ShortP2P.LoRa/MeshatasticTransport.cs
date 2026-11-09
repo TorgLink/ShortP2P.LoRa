@@ -555,7 +555,10 @@ public sealed class MeshatasticTransport : ITransport
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
                 var now = DateTime.UtcNow;
-                foreach (var stalled in _reassembler.GetStalled(now, _options.Retry.RxTimeout))
+                // Control / short / medium text: duty-scaled RxTimeout (~141 s).
+                // Large text / binary (est. ≥ 1000 B, TX priorities 4–6): LargePayloadTimeout (180 s).
+                var retryCfg = _options.Retry;
+                foreach (var stalled in _reassembler.GetStalled(now, size => retryCfg.ChunkTimeoutForEstimatedSize(size)))
                 {
                     if (!stalled.From.TryToNodeNumber(out var fromNode))
                     {
@@ -564,7 +567,7 @@ public sealed class MeshatasticTransport : ITransport
                     }
 
                     var retry = _reassembler.NoteRetry(stalled.From, stalled.Id);
-                    if (retry > _options.Retry.RxMaxRetries)
+                    if (retry > retryCfg.RxMaxRetries)
                     {
                         _reassembler.Drop(stalled.From, stalled.Id);
                         _logger?.LogWarning("Dropped stalled message {Id} from {From} after {Max} retries", stalled.Id,
