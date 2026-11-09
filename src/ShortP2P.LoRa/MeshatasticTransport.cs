@@ -210,9 +210,9 @@ public sealed class MeshatasticTransport : ITransport
             var first = payload.Length > 0 ? payload.Span[0] : (byte)0;
             if (payload.Length <= _options.MaxRadioPayloadBytes)
             {
-                _logger?.LogInformation(
-                    "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} (single radio frame)",
-                    first, payload.Length, node);
+                _logger?.LogTrace(
+                    "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} (single radio frame): {Hex}",
+                    first, payload.Length, node, Convert.ToHexString(payload.Span));
                 await SendFrameWithRetryAsync(node, payload, cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -223,9 +223,9 @@ public sealed class MeshatasticTransport : ITransport
             var total = (ushort)((payload.Length + chunkDataSize - 1) / chunkDataSize);
             var frame = new byte[_options.MaxRadioPayloadBytes];
 
-            _logger?.LogInformation(
-                "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id})",
-                first, payload.Length, node, total, id);
+            _logger?.LogTrace(
+                "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id}): {Hex}",
+                first, payload.Length, node, total, id, Convert.ToHexString(payload.Span));
 
             // Burst chunks back-to-back while holding the TX window so presence cannot interleave
             // mid-datagram (duty-cycle deferral still applies per frame inside the gate).
@@ -234,9 +234,9 @@ public sealed class MeshatasticTransport : ITransport
                 var offset = (number - 1) * chunkDataSize;
                 var take = Math.Min(chunkDataSize, payload.Length - offset);
                 var written = ChunkCodec.WriteChunk(frame, id, number, total, crc, payload.Span.Slice(offset, take));
-                _logger?.LogInformation(
-                    "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}",
-                    number, total, written, id, node);
+                _logger?.LogTrace(
+                    "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}: {Hex}",
+                    number, total, written, id, node, Convert.ToHexString(frame.AsSpan(0, written)));
                 await SendFrameWithRetryAsync(node, frame.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
             }
 
@@ -332,6 +332,10 @@ public sealed class MeshatasticTransport : ITransport
                 RequestResend(from, chunk.Id, RetryRequestCodec.ReasonInconsistentCrc);
                 break;
             case ChunkAddResult.NeedMore:
+                _logger?.LogTrace(
+                    "LoRa RX chunk {Number}/{Total} id {Id} from {From:X8} ({Bytes} bytes): {Hex}",
+                    chunk.Number, chunk.Total, chunk.Id, from, bytes.Length, Convert.ToHexString(bytes));
+                break;
             case ChunkAddResult.Duplicate:
             default:
                 break;
@@ -354,9 +358,9 @@ public sealed class MeshatasticTransport : ITransport
         }
 
         var frame = datagram.Length > 0 ? datagram[0] : (byte)0;
-        _logger?.LogInformation(
-            "RX chat frame 0x{Frame:X2} ({Bytes} bytes) from {From}",
-            frame, datagram.Length, from.ToHex());
+        _logger?.LogTrace(
+            "RX chat frame 0x{Frame:X2} ({Bytes} bytes) from {From}: {Hex}",
+            frame, datagram.Length, from.ToHex(), Convert.ToHexString(datagram));
         if (!_channel.Writer.TryWrite(new TransportReceiveMessage(datagram,
                 MeshatasticTransportAddress.ToTransportAddress(from))))
             _logger?.LogWarning("RX chat frame 0x{Frame:X2} from {From} dropped: inbound channel full", frame,
