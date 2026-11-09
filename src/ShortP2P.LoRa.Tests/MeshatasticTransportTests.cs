@@ -304,16 +304,17 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Duty_Scaled_Timeout_Matches_Formula()
     {
-        // Timeout = Tb * (1 + 0.015 * Nrx); Tb=10s, Nrx=99 → 24.85s
-        var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(10), 99);
-        Assert.Equal(TimeSpan.FromSeconds(24.85), timeout);
+        // Timeout = Tb * (1 + 0.015 * Nrx); Tb=60s, Nrx=99 → 149.1s
+        var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(60), 99);
+        Assert.Equal(TimeSpan.FromSeconds(149.1), timeout);
 
         var fromDuty = RetryConfig.FromTxDutyPercent(1.0);
         Assert.Equal(99, fromDuty.RxDutyPercent);
+        Assert.Equal(TimeSpan.FromSeconds(60), fromDuty.BaseTimeout);
         Assert.Equal(timeout, fromDuty.RxTimeout);
         Assert.Equal(timeout, fromDuty.SendRetryIntervalBase);
         Assert.Equal(timeout, fromDuty.SendDelay(0));
-        Assert.Equal(TimeSpan.FromSeconds(49.7), fromDuty.SendDelay(1));
+        Assert.Equal(TimeSpan.FromSeconds(298.2), fromDuty.SendDelay(1));
     }
 
     [Fact]

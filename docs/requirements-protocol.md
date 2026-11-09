@@ -32,11 +32,11 @@ Retry settings live in the same config as the COM port (`MeshatasticTransportOpt
 They are stretched by the RX duty-cycle share so ack / next-chunk waits match the channel budget
 (TX 1% / RX 99% by default, REQ-RF-2):
 
-`Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 10 s` and `Nrx = 100 − TX%` (default 99 → **≈ 24.85 s**).
+`Timeout = Tb × (1 + 0.015 × Nrx)` with `Tb = 60 s` and `Nrx = 100 − TX%` (default 99 → **≈ 149.1 s**).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `BaseTimeout` (Tb) | **10 s** | Base wait for a receipt / next chunk before duty scaling. |
+| `BaseTimeout` (Tb) | **60 s** | Base wait for a receipt / next chunk before duty scaling. |
 | `RxDutyPercent` (Nrx) | **99** | RX share of the airtime budget (`100 − TX%`). |
 | `RxTimeout` | **Timeout** | No next chunk for this long → ask for resend. |
 | `SendRetryIntervalBase` | **Timeout** | Base of the send backoff. |

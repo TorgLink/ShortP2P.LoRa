@@ -2,16 +2,16 @@ namespace ShortP2P.LoRa.Reliability;
 
 /// <summary>
 ///     Send-Retry / Receive-Retry settings (REQ-CFG-3), stretched by the RX duty-cycle share.
-///     Base ack/chunk wait is <see cref="BaseTimeout" /> (Tb = 10 s). Under a TX 1% / RX 99%
+///     Base ack/chunk wait is <see cref="BaseTimeout" /> (Tb = 60 s). Under a TX 1% / RX 99%
 ///     budget the peer may need many listen slots before it can TX a receipt or next chunk, so:
-///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 99 → ≈ 24.85 s).
+///     <c>Timeout = Tb * (1 + 0.015 * Nrx)</c> with <c>Nrx</c> = RX percent (default 99 → ≈ 149.1 s).
 ///     Send/Rx retry interval bases use the same timeout; backoff remains exponential:
 ///     <c>interval(retry) = Timeout * 2^retry</c>.
 /// </summary>
 public sealed record RetryConfig
 {
-    /// <summary>Tb — base wait for a receipt / next chunk before duty scaling. Default 10 s.</summary>
-    public static readonly TimeSpan DefaultBaseTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>Tb — base wait for a receipt / next chunk before duty scaling. Default 60 s.</summary>
+    public static readonly TimeSpan DefaultBaseTimeout = TimeSpan.FromSeconds(60);
 
     /// <summary>Stretch coefficient in <c>Timeout = Tb * (1 + k * Nrx)</c>.</summary>
     public const double DefaultDutyStretchPerRxPercent = 0.015;
@@ -53,7 +53,7 @@ public sealed record RetryConfig
 
     /// <summary>
     ///     <c>Timeout = Tb * (1 + stretch * Nrx)</c>.
-    ///     Example: Tb=10 s, Nrx=99 → 10 * (1 + 1.485) = 24.85 s.
+    ///     Example: Tb=60 s, Nrx=99 → 60 * (1 + 1.485) = 149.1 s.
     /// </summary>
     public static TimeSpan ComputeTimeout(
         TimeSpan baseTimeout,
@@ -77,7 +77,7 @@ public sealed record RetryConfig
 
     /// <summary>
     ///     Build retry settings from the configured TX duty-cycle percent so timeouts follow the
-    ///     channel budget (Tb=10 s unless overridden).
+    ///     channel budget (Tb=60 s unless overridden).
     /// </summary>
     public static RetryConfig FromTxDutyPercent(double txDutyPercent, TimeSpan? baseTimeout = null)
     {
