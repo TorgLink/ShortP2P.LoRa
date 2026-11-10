@@ -101,7 +101,11 @@ public sealed class MeshatasticTransport : ITransport
         _link.Received += OnLinkFrame;
         _started = true;
 
-        await ApplyConfiguredTxPowerAsync(cancellationToken).ConfigureAwait(false);
+        if (_options.ApplyTxPowerOnStart)
+            await ApplyConfiguredTxPowerAsync(cancellationToken).ConfigureAwait(false);
+        else
+            _logger?.LogInformation(
+                "Skipping board TX-power apply on start (ApplyTxPowerOnStart=false); board LoRa region/channel unchanged");
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _sweepTask = Task.Run(() => SweepLoopAsync(_cts.Token));

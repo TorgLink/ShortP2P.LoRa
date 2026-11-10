@@ -378,18 +378,28 @@ internal sealed class MeshtasticSerialSession
                 },
                 onAdminPayload: admin =>
                 {
+                    Logger?.LogDebug("Admin payload {Bytes} bytes from board", admin.Length);
                     if (MeshtasticProto.TryReadAdminSessionPasskey(admin, out var key))
                     {
                         _adminPasskey = key;
                         changed = true;
+                        Logger?.LogDebug("Admin session_passkey received ({Len} bytes)", key.Length);
                     }
 
                     // Only write after we have the board's current LoRaConfig (get_config_response).
-                    if (_pendingTxPowerDbm is int dbm &&
-                        MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var lora))
+                    if (_pendingTxPowerDbm is int dbm)
                     {
-                        var patched = MeshtasticProto.PatchLoRaConfigTxPower(lora, dbm);
-                        WriteFullLoraConfig(patched, completeWait: true);
+                        if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var lora))
+                        {
+                            var patched = MeshtasticProto.PatchLoRaConfigTxPower(lora, dbm);
+                            WriteFullLoraConfig(patched, completeWait: true);
+                        }
+                        else
+                        {
+                            Logger?.LogDebug(
+                                "Admin payload while TX-power pending did not contain get_config_response.lora ({Bytes} bytes)",
+                                admin.Length);
+                        }
                     }
                 });
             return changed;

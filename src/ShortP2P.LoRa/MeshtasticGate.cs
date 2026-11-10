@@ -203,8 +203,10 @@ public sealed class MeshtasticGate
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            // Passkey never arrived; the first set_config without key may still have applied.
-            done.TrySetResult(true);
+            // Never write a partial LoRaConfig on timeout — that wiped region/channel before.
+            _session?.Logger?.LogWarning(
+                "TX power apply timed out waiting for get_config_response; board LoRaConfig left unchanged");
+            done.TrySetResult(false);
         }
     }
 

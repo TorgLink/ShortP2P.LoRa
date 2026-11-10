@@ -25,6 +25,13 @@ public sealed record MeshatasticTransportOptions
     /// </summary>
     public int TxPowerDbm { get; init; } = LoRaTxPower.MaxDbm;
 
+    /// <summary>
+    ///     When true, <see cref="MeshatasticTransport.StartAsync"/> pushes TxPowerDbm to the board
+    ///     (GET full LoRaConfig → patch → SET). Default false: a failed/partial apply previously
+    ///     wiped region/channel and silenced mesh RX; host settings UI can still call apply explicitly.
+    /// </summary>
+    public bool ApplyTxPowerOnStart { get; init; }
+
     public RetryConfig Retry { get; init; } = new();
 
     /// <summary>Local ShortP2P NetworkId, 12-byte wire form. Set before start.</summary>
