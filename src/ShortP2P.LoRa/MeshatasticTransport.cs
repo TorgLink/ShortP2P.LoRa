@@ -422,6 +422,11 @@ public sealed class MeshatasticTransport : ITransport
                 "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id}): {Hex}",
                 first, payload.Length, node, total, id, Convert.ToHexString(payload));
 
+            // Even-pace the whole train first (earn airtime uniformly), then spend it as one burst.
+            // Mid-chunk pace waits would stretch trains over ~10 s/chunk and break reassembly.
+            var trainAirtimeBytes = EstimateChunkTrainAirtimeBytes(payload.Length, chunkDataSize, total);
+            await _link.WaitForDutyBudgetAsync(trainAirtimeBytes, cancellationToken).ConfigureAwait(false);
+
             // Hold the TX window for the whole train so lower-priority work cannot interleave
             // mid-datagram; between chunks release the window + listen when incomplete RX is fresh
             // so Control (0x33) can slip through and peer mid-train chunks can be heard.
@@ -433,7 +438,9 @@ public sealed class MeshatasticTransport : ITransport
                 _logger?.LogTrace(
                     "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}: {Hex}",
                     number, total, written, id, node, Convert.ToHexString(frame.AsSpan(0, written)));
-                await SendFrameWithRetryAsync(node, frame.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
+                await SendFrameWithRetryAsync(node, frame.AsMemory(0, written),
+                        paceExempt: true, cancellationToken)
+                    .ConfigureAwait(false);
                 if (number < total)
                     await ListenBetweenTrainChunksAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -452,8 +459,27 @@ public sealed class MeshatasticTransport : ITransport
     }
 
     /// <summary>
+    ///     Estimated duty-accounted bytes for a chunk train (payload + per-frame radio overhead),
+    ///     matching <see cref="MeshtasticGate"/> single-frame WaitTimeFor accounting.
+    /// </summary>
+    private static int EstimateChunkTrainAirtimeBytes(int payloadLength, int chunkDataSize, int totalChunks)
+    {
+        var overhead = MeshtasticGate.DutyRadioOverheadBytes;
+        var remaining = payloadLength;
+        var sum = 0;
+        for (var i = 0; i < totalChunks; i++)
+        {
+            var take = Math.Min(chunkDataSize, remaining);
+            remaining -= take;
+            sum += ChunkCodec.HeaderLength + take + overhead;
+        }
+
+        return sum;
+    }
+
+    /// <summary>
     ///     Between radio chunks of one datagram: brief listen window for peer RX. The TX window
-    ///     stays held so another datagram cannot interleave; duty-cycle gate already spaces TX.
+    ///     stays held so another datagram cannot interleave; train airtime was already even-paced.
     /// </summary>
     private async Task ListenBetweenTrainChunksAsync(CancellationToken cancellationToken)
     {
@@ -470,14 +496,19 @@ public sealed class MeshatasticTransport : ITransport
         await Task.Delay(slot, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task SendFrameWithRetryAsync(uint node, ReadOnlyMemory<byte> frame, CancellationToken cancellationToken)
+    private async Task SendFrameWithRetryAsync(uint node, ReadOnlyMemory<byte> frame,
+        CancellationToken cancellationToken) =>
+        await SendFrameWithRetryAsync(node, frame, paceExempt: false, cancellationToken).ConfigureAwait(false);
+
+    private async Task SendFrameWithRetryAsync(uint node, ReadOnlyMemory<byte> frame, bool paceExempt,
+        CancellationToken cancellationToken)
     {
         var max = _options.Retry.SendMaxRetries;
         for (var attempt = 0; ; attempt++)
         {
             try
             {
-                await _link.SendAsync(node, frame, cancellationToken).ConfigureAwait(false);
+                await _link.SendAsync(node, frame, paceExempt, cancellationToken).ConfigureAwait(false);
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

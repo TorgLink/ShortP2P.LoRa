@@ -47,11 +47,37 @@ public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog, IMeshRadio
         return new ValueTask(_gate.CloseSessionAsync(_token, cancellationToken));
     }
 
-    public ValueTask SendAsync(uint to, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    public ValueTask SendAsync(uint to, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default) =>
+        SendAsync(to, payload, paceExempt: false, cancellationToken);
+
+    /// <inheritdoc />
+    public ValueTask SendAsync(uint to, ReadOnlyMemory<byte> payload, bool paceExempt,
+        CancellationToken cancellationToken = default)
     {
         if (payload.Length == 0)
             throw new ArgumentException("Payload is empty.", nameof(payload));
-        return new ValueTask(_gate.SendAsync(_token, to, payload, cancellationToken));
+        return new ValueTask(_gate.SendAsync(_token, to, payload, paceExempt, cancellationToken));
+    }
+
+    /// <inheritdoc />
+    public async ValueTask WaitForDutyBudgetAsync(int estimatedAirtimeBytes,
+        CancellationToken cancellationToken = default)
+    {
+        if (estimatedAirtimeBytes <= 0)
+            return;
+
+        while (true)
+        {
+            var wait = await _gate.PeekDutyWaitExactAsync(estimatedAirtimeBytes, cancellationToken)
+                .ConfigureAwait(false);
+            if (wait <= TimeSpan.Zero)
+                return;
+
+            _logger?.LogInformation(
+                "Duty cycle even pace: waiting {Seconds:F1}s to earn TX budget for {Bytes} airtime-bytes",
+                wait.TotalSeconds, estimatedAirtimeBytes);
+            await Task.Delay(wait, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>Ask the board to resend its node database; the refreshed snapshot lands in <see cref="Nodes" />.</summary>

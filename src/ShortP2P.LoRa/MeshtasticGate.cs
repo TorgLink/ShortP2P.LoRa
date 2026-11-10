@@ -161,14 +161,19 @@ public sealed class MeshtasticGate
         return task.WaitAsync(cancellationToken);
     }
 
-    internal Task SendAsync(object token, uint to, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+    internal Task SendAsync(object token, uint to, ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken) =>
+        SendAsync(token, to, payload, paceExempt: false, cancellationToken);
+
+    internal Task SendAsync(object token, uint to, ReadOnlyMemory<byte> payload, bool paceExempt,
+        CancellationToken cancellationToken)
     {
         if (payload.Length == 0)
             throw new ArgumentException("Payload is empty.", nameof(payload));
 
         var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var frame = payload.ToArray();
-        _commands.Add(() => TryDeliver(token, to, frame, done));
+        _commands.Add(() => TryDeliver(token, to, frame, done, paceExempt));
         return done.Task.WaitAsync(cancellationToken);
     }
 
@@ -213,6 +218,7 @@ public sealed class MeshtasticGate
     /// <summary>
     ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
     ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.
+    ///     Adds one radio-overhead estimate (single frame).
     /// </summary>
     public Task<TimeSpan> PeekDutyWaitAsync(int payloadBytes, CancellationToken cancellationToken = default)
     {
@@ -222,6 +228,22 @@ public sealed class MeshtasticGate
     }
 
     /// <summary>
+    ///     How long TX would wait before <paramref name="estimatedAirtimeBytes"/> of estimated
+    ///     on-air payload (caller already included per-frame overhead) fits even pacing + hard cap.
+    ///     Used to pre-earn budget for a whole chunk train before bursting it.
+    /// </summary>
+    public Task<TimeSpan> PeekDutyWaitExactAsync(int estimatedAirtimeBytes,
+        CancellationToken cancellationToken = default)
+    {
+        var task = EnqueueRadio(() =>
+            _duty.WaitTimeFor(Math.Max(0, estimatedAirtimeBytes), DateTime.UtcNow, enforcePace: true));
+        return task.WaitAsync(cancellationToken);
+    }
+
+    /// <summary>ToRadio protobuf overhead added per radio frame in duty estimates.</summary>
+    internal static int DutyRadioOverheadBytes => RadioOverheadBytes;
+
+    /// <summary>
     ///     Radio thread only. Sends immediately while the duty-cycle budget allows it; otherwise the
     ///     frame is parked in <see cref="_deferred" /> and fires from the loop when the window slides.
     ///     The radio thread never blocks waiting for airtime.
@@ -229,7 +251,8 @@ public sealed class MeshtasticGate
     ///     control/presence/discovery before text/binary. Presence that cannot fit the current
     ///     duty budget is still dropped (keepalive) rather than queued forever.
     /// </summary>
-    private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done)
+    private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done,
+        bool paceExempt = false)
     {
         try
         {
@@ -250,7 +273,8 @@ public sealed class MeshtasticGate
                 return;
             }
 
-            var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow);
+            var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow,
+                enforcePace: !paceExempt);
             if (wait > TimeSpan.Zero)
             {
                 if (isPresence)
@@ -265,19 +289,21 @@ public sealed class MeshtasticGate
                 session.Logger?.LogInformation(
                     "Duty cycle pace/limit ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
                     _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
-                _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done));
+                _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done, paceExempt));
                 return;
             }
 
             // Budget allows this frame. If higher-priority work is already deferred, park behind it
             // so PumpDeferred can drain by MeshtasticTxPriority (control before text/binary).
+            // Mid-train pace-exempt chunks stay ahead of other deferred work so the train finishes.
             var incomingPriority = MeshtasticTxClassifier.Classify(payload);
-            if (_deferred.Exists(d => MeshtasticTxClassifier.Classify(d.Payload) < incomingPriority))
+            if (!paceExempt &&
+                _deferred.Exists(d => MeshtasticTxClassifier.Classify(d.Payload) < incomingPriority))
             {
                 session.Logger?.LogInformation(
                     "Deferring TX priority {Priority}-{PriorityName} behind higher-priority pending radio frame(s)",
                     (int)incomingPriority, incomingPriority);
-                _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done));
+                _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done, paceExempt));
                 return;
             }
 
@@ -314,7 +340,7 @@ public sealed class MeshtasticGate
         due.Sort(static (a, b) =>
             MeshtasticTxClassifier.Classify(a.Payload).CompareTo(MeshtasticTxClassifier.Classify(b.Payload)));
         foreach (var d in due)
-            TryDeliver(d.Token, d.To, d.Payload, d.Done); // may re-defer with a fresh due time
+            TryDeliver(d.Token, d.To, d.Payload, d.Done, d.PaceExempt); // may re-defer with a fresh due time
     }
 
     private static bool IsPresencePayload(byte[] payload) =>
@@ -434,5 +460,6 @@ public sealed class MeshtasticGate
         object Token,
         uint To,
         byte[] Payload,
-        TaskCompletionSource<bool> Done);
+        TaskCompletionSource<bool> Done,
+        bool PaceExempt = false);
 }

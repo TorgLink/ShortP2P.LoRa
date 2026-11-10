@@ -13,8 +13,9 @@ public sealed class DutyCycleBudget
     public const double DefaultAirtimePerByteMs = 11.0;
 
     /// <summary>
-    ///     Wall-clock seconds of earning kept as burst credit (short chat/handshake trains).
-    ///     At TX 10% / 1 h this is 6 s of airtime.
+    ///     Wall-clock seconds of earning kept as burst credit. Airtime is still earned evenly
+    ///     (pace rate = budget/window); this only caps how much earned credit may be spent in one
+    ///     short burst (e.g. one chunk train after a prepaid wait). At TX 10% / 1 h → 6 s airtime.
     /// </summary>
     public const double DefaultBurstEarnSeconds = 60.0;
 
@@ -79,7 +80,13 @@ public sealed class DutyCycleBudget
     ///     allowed immediately when nothing else is in the window (a single frame can never be
     ///     deferred into the past).
     /// </summary>
-    public TimeSpan WaitTimeFor(int frameBytes, DateTime utcNow)
+    /// <param name="frameBytes">Payload (+ radio overhead) used for the airtime estimate.</param>
+    /// <param name="utcNow">Wall clock for purge / pace accrual.</param>
+    /// <param name="enforcePace">
+    ///     When false, only the rolling-hour hard cap applies (mid-train chunk continuations).
+    ///     Even pacing still applies to the first frame of a train and to non-train TX.
+    /// </param>
+    public TimeSpan WaitTimeFor(int frameBytes, DateTime utcNow, bool enforcePace = true)
     {
         PurgeExpired(utcNow);
         AccruePace(utcNow);
@@ -99,9 +106,16 @@ public sealed class DutyCycleBudget
                 hardWait = untilOldestLeaves;
         }
 
+        // Even pacing fills a burst tank at budget/window. Never wait for more credit than the tank
+        // can hold (otherwise a train larger than capacity would park forever). Oversized trains
+        // wait until the tank is full, then spend under the hard rolling-hour cap.
         var paceWait = TimeSpan.Zero;
-        if (_paceCredit < need && _paceRate > 0)
-            paceWait = TimeSpan.FromSeconds((need - _paceCredit) / _paceRate);
+        if (enforcePace && _paceRate > 0 && _paceCapacity > 0)
+        {
+            var paceTarget = need <= _paceCapacity ? need : _paceCapacity;
+            if (_paceCredit < paceTarget)
+                paceWait = TimeSpan.FromSeconds((paceTarget - _paceCredit) / _paceRate);
+        }
 
         var wait = hardWait > paceWait ? hardWait : paceWait;
         return wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
