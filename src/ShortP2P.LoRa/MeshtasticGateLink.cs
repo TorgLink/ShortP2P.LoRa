@@ -8,7 +8,7 @@ namespace ShortP2P.LoRa;
 ///     every operation is marshalled to the single radio thread that owns the COM port, and device
 ///     state is read from immutable snapshots. No port I/O ever happens on the caller thread.
 /// </summary>
-public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog
+public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog, IMeshRadioConfig
 {
     private readonly MeshtasticGate _gate;
     private readonly object _token;
@@ -58,6 +58,12 @@ public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog
     public ValueTask RefreshAsync(CancellationToken cancellationToken = default)
     {
         return new ValueTask(_gate.RefreshAsync(_token, cancellationToken));
+    }
+
+    /// <inheritdoc />
+    public ValueTask ApplyTxPowerDbmAsync(int txPowerDbm, CancellationToken cancellationToken = default)
+    {
+        return new ValueTask(_gate.ApplyTxPowerAsync(_token, txPowerDbm, cancellationToken));
     }
 
     public async ValueTask DisposeAsync()

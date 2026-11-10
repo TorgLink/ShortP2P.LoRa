@@ -17,6 +17,10 @@ internal static class MeshtasticProto
     public const int MaxPacketBytes = 512;
 
     public const uint PortNumPrivateApp = 256;
+    public const uint PortNumAdminApp = 6;
+
+    /// <summary>AdminMessage.ConfigType.LORA_CONFIG</summary>
+    public const uint AdminConfigTypeLora = 5;
 
     public static byte[] BuildToRadioWantConfig(uint configId)
     {
@@ -26,11 +30,14 @@ internal static class MeshtasticProto
         return ms.ToArray();
     }
 
-    public static byte[] BuildToRadioPacket(uint to, uint packetId, byte[] payload, byte hopLimit)
+    public static byte[] BuildToRadioPacket(uint to, uint packetId, byte[] payload, byte hopLimit) =>
+        BuildToRadioPacket(to, packetId, payload, hopLimit, PortNumPrivateApp);
+
+    public static byte[] BuildToRadioPacket(uint to, uint packetId, byte[] payload, byte hopLimit, uint portNum)
     {
         using var data = new MemoryStream();
         WriteVarint(data, (1 << 3) | 0); // portnum
-        WriteVarint(data, PortNumPrivateApp);
+        WriteVarint(data, portNum);
         WriteVarint(data, (2 << 3) | 2); // payload, length-delimited
         WriteVarint(data, (uint)payload.Length);
         data.Write(payload, 0, payload.Length);
@@ -57,6 +64,61 @@ internal static class MeshtasticProto
         return toRadio.ToArray();
     }
 
+    /// <summary>AdminMessage.get_config_request = LORA_CONFIG (to obtain session_passkey on modern firmware).</summary>
+    public static byte[] BuildAdminGetLoraConfig()
+    {
+        using var ms = new MemoryStream();
+        WriteVarint(ms, (5 << 3) | 0); // get_config_request
+        WriteVarint(ms, AdminConfigTypeLora);
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    ///     AdminMessage.set_config with Config.lora.tx_power only (field numbers from meshtastic protobufs).
+    /// </summary>
+    public static byte[] BuildAdminSetLoraTxPower(int txPowerDbm, ReadOnlySpan<byte> sessionPasskey)
+    {
+        using var lora = new MemoryStream();
+        WriteVarint(lora, (10 << 3) | 0); // tx_power
+        WriteVarint(lora, unchecked((uint)txPowerDbm));
+
+        var loraBytes = lora.ToArray();
+        using var config = new MemoryStream();
+        WriteVarint(config, (6 << 3) | 2); // Config.lora
+        WriteVarint(config, (uint)loraBytes.Length);
+        config.Write(loraBytes, 0, loraBytes.Length);
+
+        var configBytes = config.ToArray();
+        using var admin = new MemoryStream();
+        WriteVarint(admin, (34 << 3) | 2); // set_config
+        WriteVarint(admin, (uint)configBytes.Length);
+        admin.Write(configBytes, 0, configBytes.Length);
+        if (sessionPasskey.Length > 0)
+        {
+            WriteVarint(admin, (101 << 3) | 2); // session_passkey
+            WriteVarint(admin, (uint)sessionPasskey.Length);
+            admin.Write(sessionPasskey);
+        }
+
+        return admin.ToArray();
+    }
+
+    /// <summary>Extract AdminMessage.session_passkey (field 101) when present.</summary>
+    public static bool TryReadAdminSessionPasskey(ReadOnlySpan<byte> adminPayload, out byte[] passkey)
+    {
+        passkey = [];
+        byte[]? found = null;
+        ReadFields(adminPayload, (number, wireType, _, bytes) =>
+        {
+            if (number == 101 && wireType == 2 && bytes.Length > 0)
+                found = bytes.ToArray();
+        });
+        if (found == null)
+            return false;
+        passkey = found;
+        return true;
+    }
+
     public static byte[] Frame(byte[] protobufPayload)
     {
         if (protobufPayload.Length > MaxPacketBytes)
@@ -77,14 +139,15 @@ internal static class MeshtasticProto
     ///     config_complete_id (field 7) from the Meshtastic mesh protobufs.
     /// </summary>
     public static void ReadFromRadio(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket,
-        Action<uint>? onMyNodeNum, Action<MeshtasticRadioNode>? onNode = null, Action<uint>? onConfigComplete = null)
+        Action<uint>? onMyNodeNum, Action<MeshtasticRadioNode>? onNode = null, Action<uint>? onConfigComplete = null,
+        Action<byte[]>? onAdminPayload = null)
     {
         ReadFields(payload, (number, wireType, varint, bytes) =>
         {
             switch (number)
             {
                 case 2 when wireType == 2:
-                    TryReadMeshPacket(bytes, onPacket);
+                    TryReadMeshPacket(bytes, onPacket, onAdminPayload);
                     break;
                 case 3 when wireType == 2:
                     TryReadMyNodeInfo(bytes, onMyNodeNum);
@@ -99,7 +162,8 @@ internal static class MeshtasticProto
         });
     }
 
-    private static void TryReadMeshPacket(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket)
+    private static void TryReadMeshPacket(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket,
+        Action<byte[]>? onAdminPayload = null)
     {
         uint from = 0, to = 0;
         byte[]? decoded = null;
@@ -120,7 +184,7 @@ internal static class MeshtasticProto
             }
         });
 
-        if (decoded == null || from == 0)
+        if (decoded == null)
             return;
 
         uint? portNumber = null;
@@ -138,7 +202,16 @@ internal static class MeshtasticProto
             }
         });
 
-        if (portNumber == PortNumPrivateApp && data is { Length: > 0 })
+        if (data is not { Length: > 0 })
+            return;
+
+        if (portNumber == PortNumAdminApp)
+        {
+            onAdminPayload?.Invoke(data);
+            return;
+        }
+
+        if (portNumber == PortNumPrivateApp && from != 0)
             onPacket?.Invoke(new MeshLinkFrame(from, to, data));
     }
 

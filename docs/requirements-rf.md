@@ -213,6 +213,34 @@ Error entries MUST include `DateTimeUTC` and enough context to diagnose (operati
 
 ---
 
+## REQ-RF-8 — TorgLink TX power control (UI + board)
+
+Product settings (Maui Settings, Web settings, persisted host settings) MUST expose TX power as a discrete dropdown:
+
+| Rule | Value |
+| --- | --- |
+| Allowed choices | **5 dBm … 22 dBm** inclusive (integer steps of 1) |
+| Persistence | Stored with LoRa host settings (`TxPowerDbm`) |
+| Board apply | Written to the Meshtastic radio as `Config.LoRaConfig.tx_power` (dBm) after the serial session has a local node number |
+
+### Defaults when jurisdiction changes
+
+1. When the user selects a **jurisdiction / region** in settings, TX power MUST be reset to that region's accepted upper bound for the UI:
+   - `defaultDbm = clamp(region.PowerMaxDbm, 5, 22)` when `PowerMaxDbm > 0`.
+   - When jurisdiction is `UNSET` or `PowerMaxDbm` is unknown/zero: default **22 dBm** (UI maximum).
+2. The dropdown selection MUST update immediately to that default (before Apply), so the visible value matches the jurisdiction ceiling used by the product.
+3. On Apply / transport start, the host writes the selected dBm to the board. If the selected value exceeds the region's `PowerMaxDbm` (possible when the UI max is 22 but the region max is lower and the user raised the slider after the auto-default), the value written to the board is **clamped down** to `min(selected, region.PowerMaxDbm)` and logged at Info (old → new). Raising power above the regional max with an at-own-risk override remains REQ-RF-3 and is out of scope for this dropdown until that confirmation UI exists.
+4. Changing TX power alone MUST re-apply to the board without requiring a jurisdiction change; connect / region / power changes each produce an Info log (REQ-RF-7).
+
+### Acceptance (TX power UI)
+
+1. Fresh settings with jurisdiction `EU_868` (PowerMax 27): dropdown defaults to **22**.
+2. Selecting `EU_433` (PowerMax 10): dropdown becomes **10**.
+3. Selecting `UNSET`: dropdown becomes **22**.
+4. Apply with a live COM board: serial path sets `lora.tx_power` to the effective dBm; Info log records the applied value.
+
+---
+
 ## Out of scope (here)
 
 - Replacing MessengerServer with Meshtastic MQTT as the primary cloud API (see SMT-1).

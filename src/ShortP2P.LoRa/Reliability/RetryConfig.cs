@@ -60,6 +60,19 @@ public sealed record RetryConfig
     /// </summary>
     public TimeSpan LargePayloadTimeout { get; init; } = DefaultLargePayloadTimeout;
 
+    /// <summary>
+    ///     When at least one chunk arrived but others are still missing, wait at most this long
+    ///     before requesting a resend. Keeps incomplete trains inside the sender outbox window
+    ///     (inter-chunk gap on air is typically ~10–15 s). Default 45 s.
+    /// </summary>
+    public TimeSpan PartialAssemblyTimeout { get; init; } = TimeSpan.FromSeconds(45);
+
+    /// <summary>
+    ///     When holes already exist in 1..maxReceived (mid-train loss under half-duplex TX),
+    ///     accelerate the receive-retry vs <see cref="PartialAssemblyTimeout"/>. Default 18 s.
+    /// </summary>
+    public TimeSpan GapAssemblyTimeout { get; init; } = TimeSpan.FromSeconds(18);
+
     /// <summary>Base of the send backoff (defaults to the duty-scaled timeout).</summary>
     public TimeSpan SendRetryIntervalBase { get; init; } = DefaultDutyTimeout;
 
@@ -141,6 +154,27 @@ public sealed record RetryConfig
         if (estimatedBytes >= largeMinBytes && LargePayloadTimeout > RxTimeout)
             return LargePayloadTimeout;
         return RxTimeout;
+    }
+
+    /// <summary>
+    ///     Next-chunk wait using size band plus partial-assembly acceleration when some chunks
+    ///     already arrived (missing last/first chunk of a train). With mid-train holes
+    ///     (<paramref name="hasGaps"/>) uses the shorter <see cref="GapAssemblyTimeout"/>.
+    /// </summary>
+    public TimeSpan ChunkTimeoutForProgress(
+        int estimatedBytes,
+        int missingChunks,
+        int receivedChunks,
+        bool hasGaps = false,
+        int largeMinBytes = DefaultLargePayloadMinBytes)
+    {
+        var full = ChunkTimeoutForEstimatedSize(estimatedBytes, largeMinBytes);
+        if (missingChunks <= 0 || receivedChunks <= 0)
+            return full;
+        var partial = hasGaps && GapAssemblyTimeout < PartialAssemblyTimeout
+            ? GapAssemblyTimeout
+            : PartialAssemblyTimeout;
+        return partial < full ? partial : full;
     }
 
     public TimeSpan SendDelay(int retry)

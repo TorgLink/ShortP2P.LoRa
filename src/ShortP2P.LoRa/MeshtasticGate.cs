@@ -172,6 +172,42 @@ public sealed class MeshtasticGate
         return done.Task.WaitAsync(cancellationToken);
     }
 
+    /// <summary>Apply Config.LoRaConfig.tx_power on the open session (REQ-RF-8).</summary>
+    internal async Task ApplyTxPowerAsync(object token, int txPowerDbm, CancellationToken cancellationToken)
+    {
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commands.Add(() =>
+        {
+            try
+            {
+                var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+                if (session == null)
+                {
+                    done.TrySetResult(false);
+                    return;
+                }
+
+                session.BeginApplyTxPower(txPowerDbm, done);
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await done.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Passkey never arrived; the first set_config without key may still have applied.
+            done.TrySetResult(true);
+        }
+    }
+
     /// <summary>
     ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
     ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.
@@ -203,6 +239,15 @@ public sealed class MeshtasticGate
             }
 
             var isPresence = IsPresencePayload(payload);
+            // Presence is keepalive: never cut in front of deferred chat/chunk/control work.
+            if (isPresence && _deferred.Exists(d => !IsPresencePayload(d.Payload)))
+            {
+                session.Logger?.LogInformation(
+                    "Skipping presence TX — non-presence radio work is already deferred");
+                done.TrySetResult(true);
+                return;
+            }
+
             var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow);
             if (wait > TimeSpan.Zero)
             {
@@ -216,7 +261,7 @@ public sealed class MeshtasticGate
                 }
 
                 session.Logger?.LogInformation(
-                    "Duty cycle budget spent ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
+                    "Duty cycle pace/limit ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
                     _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
                 _deferred.Add(new DeferredSend(DateTime.UtcNow + wait, token, to, payload, done));
                 return;
@@ -351,13 +396,16 @@ public sealed class MeshtasticGate
         if (session == null)
             return;
 
+        // Fail pending radio work cleanly before closing the port so callers do not see a raw
+        // "Serial port is closed" mid-burst without a stop/replace reason.
+        foreach (var d in _deferred)
+            d.Done.TrySetException(new IOException($"Meshtastic serial link is stopped ({reason})."));
+        _deferred.Clear();
+
         _session = null;
         _sessionToken = null;
         _nodeNumberWait?.TrySetCanceled();
         _nodeNumberWait = null;
-        foreach (var d in _deferred)
-            d.Done.TrySetException(new IOException("Meshtastic serial link is stopped."));
-        _deferred.Clear();
         try
         {
             session.Close();

@@ -34,6 +34,7 @@ public sealed class ChunkReassembler
         public required uint Crc;
         public readonly Dictionary<ushort, byte[]> Chunks = new();
         public DateTime LastChunkUtc;
+        public DateTime LastRetryUtc;
         public int RetryCount;
         public int ReceivedBytes;
         public int MaxChunkDataBytes;
@@ -104,9 +105,51 @@ public sealed class ChunkReassembler
     }
 
     /// <summary>
+    ///     True when any incomplete assembly received a chunk within <paramref name="freshWindow"/>.
+    ///     Used to pause TX so half-duplex RX can finish a peer chunk train.
+    /// </summary>
+    public bool HasFreshIncomplete(DateTime utcNow, TimeSpan freshWindow)
+    {
+        foreach (var state in _states.Values)
+        {
+            if (state.Chunks.Count >= state.Total)
+                continue;
+            if (utcNow - state.LastChunkUtc <= freshWindow)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     Snapshot of an in-progress assembly: holes in 1..maxReceived, and whether the last
+    ///     chunk number already arrived (common when airtime loss drops mid-train packets).
+    /// </summary>
+    public bool TryGetProgress(MeshId from, string id, out AssemblyProgress progress)
+    {
+        progress = default;
+        if (!_states.TryGetValue(KeyOf(from, id), out var state))
+            return false;
+
+        var missing = state.Total - state.Chunks.Count;
+        var hasGaps = HasGaps(state);
+        var hasLast = state.Chunks.ContainsKey(state.Total);
+        progress = new AssemblyProgress(
+            state.Total,
+            state.Chunks.Count,
+            missing,
+            hasGaps,
+            hasLast,
+            state.LastChunkUtc,
+            state.LastRetryUtc,
+            state.RetryCount);
+        return true;
+    }
+
+    /// <summary>
     ///     Assemblies that saw no new chunk for a fixed <paramref name="timeout" />.
     /// </summary>
-    public IReadOnlyList<(MeshId From, string Id, int RetryCount)> GetStalled(
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
         DateTime utcNow, TimeSpan timeout) =>
         GetStalled(utcNow, _ => timeout);
 
@@ -114,25 +157,59 @@ public sealed class ChunkReassembler
     ///     Assemblies that saw no new chunk for the timeout selected from estimated reassembled size.
     ///     Size estimate = received bytes + missingChunks × max observed chunk data length.
     /// </summary>
-    public IReadOnlyList<(MeshId From, string Id, int RetryCount)> GetStalled(
-        DateTime utcNow, Func<int, TimeSpan> timeoutForSize)
-    {
-        ArgumentNullException.ThrowIfNull(timeoutForSize);
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
+        DateTime utcNow, Func<int, TimeSpan> timeoutForSize) =>
+        GetStalled(utcNow, (estimated, missing, received, _) => timeoutForSize(estimated));
 
-        var result = new List<(MeshId, string, int)>();
+    /// <summary>
+    ///     Assemblies that saw no new chunk for the timeout selected from size and completeness.
+    ///     <paramref name="timeoutForProgress"/> receives (estimatedBytes, missingChunks, receivedChunks).
+    /// </summary>
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
+        DateTime utcNow, Func<int, int, int, TimeSpan> timeoutForProgress) =>
+        GetStalled(utcNow, (estimated, missing, received, _) =>
+            timeoutForProgress(estimated, missing, received));
+
+    /// <summary>
+    ///     Assemblies that saw no new chunk for the timeout selected from size, completeness, and gaps.
+    ///     <paramref name="timeoutForProgress"/> receives
+    ///     (estimatedBytes, missingChunks, receivedChunks, hasGaps).
+    /// </summary>
+    public IReadOnlyList<(MeshId From, string Id, int RetryCount, DateTime LastRetryUtc)> GetStalled(
+        DateTime utcNow, Func<int, int, int, bool, TimeSpan> timeoutForProgress)
+    {
+        ArgumentNullException.ThrowIfNull(timeoutForProgress);
+
+        var result = new List<(MeshId, string, int, DateTime)>();
         foreach (var (key, state) in _states)
         {
             var estimated = EstimateBytes(state);
-            var timeout = timeoutForSize(estimated);
+            var missing = state.Total - state.Chunks.Count;
+            var timeout = timeoutForProgress(estimated, missing, state.Chunks.Count, HasGaps(state));
             if (utcNow - state.LastChunkUtc < timeout)
                 continue;
 
             var sep = key.IndexOf(':');
             var from = new MeshId(Convert.FromHexString(key[..sep]));
-            result.Add((from, key[(sep + 1)..], state.RetryCount));
+            result.Add((from, key[(sep + 1)..], state.RetryCount, state.LastRetryUtc));
         }
 
         return result;
+    }
+
+    /// <summary>True when some chunk number ≤ max(received) is missing (mid-train loss).</summary>
+    private static bool HasGaps(State state)
+    {
+        if (state.Chunks.Count == 0)
+            return false;
+        var max = 0;
+        foreach (var n in state.Chunks.Keys)
+        {
+            if (n > max)
+                max = n;
+        }
+
+        return max > state.Chunks.Count;
     }
 
     private static int EstimateBytes(State state)
@@ -144,16 +221,34 @@ public sealed class ChunkReassembler
         return state.ReceivedBytes + missing * perChunk;
     }
 
-    /// <summary>Marks one Receive-Retry request for this assembly. Returns the new retry count.</summary>
-    public int NoteRetry(MeshId from, string id)
+    /// <summary>Progress of one incomplete (or just-completed) reassembly.</summary>
+    public readonly record struct AssemblyProgress(
+        ushort Total,
+        int Received,
+        int Missing,
+        bool HasGaps,
+        bool HasLastChunk,
+        DateTime LastChunkUtc,
+        DateTime LastRetryUtc,
+        int RetryCount);
+
+    /// <summary>
+    ///     Marks one Receive-Retry request for this assembly. Returns the new retry count.
+    ///     Does not touch <see cref="State.LastChunkUtc"/> — stall gap stays tied to real RX;
+    ///     pacing between retries uses <see cref="State.LastRetryUtc"/>.
+    /// </summary>
+    public int NoteRetry(MeshId from, string id, DateTime utcNow)
     {
         var key = KeyOf(from, id);
         if (!_states.TryGetValue(key, out var state))
             return 0;
         state.RetryCount++;
-        state.LastChunkUtc = DateTime.UtcNow;
+        state.LastRetryUtc = utcNow;
         return state.RetryCount;
     }
+
+    /// <inheritdoc cref="NoteRetry(MeshId, string, DateTime)"/>
+    public int NoteRetry(MeshId from, string id) => NoteRetry(from, id, DateTime.UtcNow);
 
     public void Drop(MeshId from, string id)
     {

@@ -21,6 +21,8 @@ public class MeshtasticTxPriorityTests
     [InlineData(0x33, 30, MeshtasticTxPriority.Control)]
     public void Control_Frames_Are_Priority_One(byte first, int len, MeshtasticTxPriority expected)
     {
+        // Goal: invite/presence/session/directory/retry frames classify as Control priority.
+        // Expected: Classify returns MeshtasticTxPriority.Control for each InlineData first-byte.
         Assert.Equal(expected, MeshtasticTxClassifier.Classify(Frame(first, len)));
         Assert.Equal(expected,
             MeshtasticTxClassifier.Classify(Frame(first, len), MeshtasticTxContentKind.Binary));
@@ -35,6 +37,8 @@ public class MeshtasticTxPriorityTests
     [InlineData(5000, MeshtasticTxPriority.LargeText)]
     public void Cipher_Defaults_To_Text_Size_Bands(int len, MeshtasticTxPriority expected)
     {
+        // Goal: 0x02 cipher frames without Binary hint map to text size bands.
+        // Expected: ≤200 ShortText, 201–999 MediumText, ≥1000 LargeText.
         Assert.Equal(expected, MeshtasticTxClassifier.Classify(Frame(0x02, len)));
         Assert.Equal(expected, MeshtasticTxClassifier.ClassifySized(MeshtasticTxContentKind.Text, len));
     }
@@ -46,6 +50,8 @@ public class MeshtasticTxPriorityTests
     [InlineData(20 * 1024, MeshtasticTxPriority.LargeBinary)]
     public void Binary_Size_Bands(int len, MeshtasticTxPriority expected)
     {
+        // Goal: Binary content kind maps size to SmallBinary vs LargeBinary.
+        // Expected: ≤5120 SmallBinary; ≥5121 LargeBinary.
         Assert.Equal(expected,
             MeshtasticTxClassifier.Classify(Frame(0x02, len), MeshtasticTxContentKind.Binary));
         Assert.Equal(expected, MeshtasticTxClassifier.ClassifySized(MeshtasticTxContentKind.Binary, len));
@@ -54,6 +60,8 @@ public class MeshtasticTxPriorityTests
     [Fact]
     public void Chunk_Frames_Classify_As_Control()
     {
+        // Goal: mesh chunk frames are treated as control traffic for TX priority.
+        // Expected: Classify(chunk) == Control.
         var chunk = new byte[ChunkCodec.HeaderLength + 8];
         ChunkCodec.WriteChunk(chunk, "Ab12Cd", 1, 2, 0xAABBCCDD, [1, 2, 3, 4, 5, 6, 7, 8]);
         Assert.Equal(MeshtasticTxPriority.Control, MeshtasticTxClassifier.Classify(chunk));
@@ -62,6 +70,8 @@ public class MeshtasticTxPriorityTests
     [Fact]
     public void ChatWire_Kind_Maps_Text_Vs_Binary()
     {
+        // Goal: ChatWire kind bytes map to Text vs Binary content hints.
+        // Expected: 0x01/0x09 → Text; 0x02/0x03/0x04 → Binary.
         Assert.Equal(MeshtasticTxContentKind.Text, MeshtasticTxClassifier.ContentKindFromChatWireKind(0x01));
         Assert.Equal(MeshtasticTxContentKind.Text, MeshtasticTxClassifier.ContentKindFromChatWireKind(0x09));
         Assert.Equal(MeshtasticTxContentKind.Binary, MeshtasticTxClassifier.ContentKindFromChatWireKind(0x02));
@@ -72,6 +82,8 @@ public class MeshtasticTxPriorityTests
     [Fact]
     public void Priority_Queues_Drain_Higher_Before_Lower_Fifo_Within()
     {
+        // Goal: priority queues drain higher priority first and keep FIFO within a band.
+        // Expected: Control, ShortText×2, MediumText, SmallBinary, LargeBinary in that order.
         var queues = new MeshtasticTxPriorityQueues();
 
         void Enqueue(MeshtasticTxPriority priority)

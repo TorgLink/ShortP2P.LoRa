@@ -82,6 +82,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Kind_Is_Meshtastic()
     {
+        // Goal: transport advertises the Meshtastic transport kind.
+        // Expected: Kind == TransportKind.Meshtastic (== 5).
         var (a, _, _, _) = await StartPairAsync();
         Assert.Equal((byte)5, a.Kind);
         Assert.Equal(TransportKind.Meshtastic, a.Kind);
@@ -91,6 +93,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task SingleFrame_Datagram_Delivers_Unchanged()
     {
+        // Goal: small cipher datagrams skip chunking and arrive byte-identical.
+        // Expected: Bob inbound equals payload; Alice sent exactly one unchunked frame.
         var (a, b, linkA, _) = await StartPairAsync();
         var payload = Cipher();
 
@@ -107,6 +111,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Large_Datagram_Is_Chunked_And_Reassembled()
     {
+        // Goal: oversized datagrams are split into ≤233-byte chunks and reassembled on RX.
+        // Expected: Bob receives the original payload; Alice sent the computed chunk count, all parseable.
         var (a, b, linkA, _) = await StartPairAsync();
 
         var payload = new byte[2000];
@@ -128,6 +134,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task SendRetry_On_Radio_Failure()
     {
+        // Goal: transient radio send failures are retried until success within the retry budget.
+        // Expected: 3 attempts, 1 successful air frame, Bob still receives the datagram.
         var (a, b, linkA, _) = await StartPairAsync(aliceRetries: 3);
 
         linkA.FailNextSends = 2; // first two attempts throw
@@ -143,6 +151,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task SendRetry_Exhausted_Throws()
     {
+        // Goal: exhausting send retries surfaces a hard failure to the caller.
+        // Expected: SendAsync throws IOException when every attempt fails.
         var (a, _, linkA, _) = await StartPairAsync(aliceRetries: 1);
         linkA.FailNextSends = 5;
 
@@ -153,6 +163,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Unset_Jurisdiction_Allows_Transmit_At_Default_Duty_Cycle()
     {
+        // Goal: UNSET jurisdiction no longer blocks TX (REQ-RF-2); default duty cycle applies.
+        // Expected: SendAsync succeeds and one frame is recorded on the fake link.
         var (linkA, _) = FakeMeshLink.CreatePair(AliceNode, BobNode);
         var options = MakeOptions(jurisdiction: JurisdictionCatalog.Unset);
         var a = new MeshatasticTransport(options, linkA);
@@ -167,6 +179,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Rejects_NonChat_Frames()
     {
+        // Goal: transport SendAsync accepts only chat/cipher frames, not presence or empty payloads.
+        // Expected: ArgumentException for 0x50 presence and for empty byte[].
         var (a, _, _, _) = await StartPairAsync();
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
@@ -179,6 +193,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Dropped_Chunk_Triggers_RetryRequest_And_Resend()
     {
+        // Goal: a dropped last chunk causes RX to emit 0x33 and TX to resend the whole train.
+        // Expected: Bob gets full payload; Alice sent 2×chunk count; Bob sent a RetryRequest frame.
         // Bob gets one Receive-Retry budget: the first resend must succeed.
         var (a, b, linkA, linkB) = await StartPairAsync(aliceRetries: 0, bobRetries: 1);
 
@@ -212,6 +228,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task ThirdParty_Chunks_Do_Not_Corrupt_Others_Assembly()
     {
+        // Goal: unrelated third-party chunks must not break reassembly of Alice→Bob traffic.
+        // Expected: Bob still delivers Alice's original 1000-byte payload.
         var (a, b, _, linkB) = await StartPairAsync();
         var eve = new FakeMeshLink(EveNode) { Peer = linkB };
         await eve.StartAsync();
@@ -234,6 +252,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Invite_Registers_Sender_In_Directory()
     {
+        // Goal: an invite for the local NetworkId registers Alice's MeshId as an active destination.
+        // Expected: Bob.Directory.GetActiveDestinations(NetworkId) contains AliceNode.
         var (a, b, _, _) = await StartPairAsync(withNetworkIds: true);
         await a.SendAsync(Invite(NetworkId), Addr(BobNode));
 
@@ -250,6 +270,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task Invite_Registers_Sender_For_Its_NetworkId()
     {
+        // Goal: invite NetworkId (even foreign) keys the directory binding, not only the local id.
+        // Expected: Bob lists Alice under GetActiveDestinations(foreign).
         var (a, b, _, _) = await StartPairAsync(withNetworkIds: true);
         var foreign = Enumerable.Range(100, 12).Select(i => (byte)i).ToArray();
         await a.SendAsync(Invite(foreign), Addr(BobNode));
@@ -266,6 +288,8 @@ public class MeshatasticTransportTests
     [Fact]
     public async Task DirectorySnapshot_Is_Sent_On_Change_And_Merged()
     {
+        // Goal: directory changes emit 0x32 snapshots that peers merge into their directory.
+        // Expected: Alice sent a 0x32 frame; Bob snapshot contains Alice Self under NetworkId.
         var (a, b, linkA, _) = await StartPairAsync(withNetworkIds: true);
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
@@ -293,6 +317,8 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Backoff_Is_Exponential()
     {
+        // Goal: send/rx retry delays grow exponentially from the configured bases.
+        // Expected: SendDelay(0)=1s, SendDelay(2)=4s, RxDelay(1)=2s.
         var cfg = new RetryConfig
         {
             SendRetryIntervalBase = TimeSpan.FromSeconds(1),
@@ -306,6 +332,8 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Duty_Scaled_Timeout_Matches_Formula()
     {
+        // Goal: FromTxDutyPercent derives timeouts from the duty-scaled formula.
+        // Expected: Tb=60s, Nrx=90 → 141s RxTimeout/SendDelay(0); SendDelay(1)=282s; LargePayloadTimeout=180s.
         // Timeout = Tb * (1 + 0.015 * Nrx); Tb=60s, Nrx=90 → 141s
         var timeout = RetryConfig.ComputeTimeout(TimeSpan.FromSeconds(60), 90);
         Assert.Equal(TimeSpan.FromSeconds(141), timeout);
@@ -323,6 +351,8 @@ public class MeshatasticTransportTests
     [Fact]
     public void RetryConfig_Large_Payload_Uses_180s_Overall_Chunk_Timeout()
     {
+        // Goal: large estimated payloads use a fixed 180 s overall chunk timeout.
+        // Expected: <1000 B → RxTimeout; ≥1000 B → 180 s.
         var cfg = RetryConfig.FromTxDutyPercent(10.0);
         // Control / short / medium (< 1000 B): duty-scaled ≈ 141 s
         Assert.Equal(cfg.RxTimeout, cfg.ChunkTimeoutForEstimatedSize(200));
@@ -335,6 +365,8 @@ public class MeshatasticTransportTests
     [Fact]
     public void SessionSetup_NetworkId_Is_Extracted()
     {
+        // Goal: session-setup frames expose the embedded 12-byte NetworkId.
+        // Expected: TryExtract succeeds and returns NetworkId.
         var frame = new byte[1 + 12];
         frame[0] = 0x04;
         Array.Copy(NetworkId, 0, frame, 1, 12);

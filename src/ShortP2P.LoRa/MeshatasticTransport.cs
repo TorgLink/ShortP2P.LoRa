@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using ShortP2P.LoRa.Chunking;
 using ShortP2P.LoRa.Directory;
+using ShortP2P.LoRa.Jurisdiction;
 using ShortP2P.LoRa.Link;
 using ShortP2P.LoRa.Reliability;
 using ShortP2P.Transport.Abstractions;
@@ -29,6 +30,7 @@ public sealed class MeshatasticTransport : ITransport
     private readonly Channel<TransportReceiveMessage> _channel = Channel.CreateUnbounded<TransportReceiveMessage>();
     private readonly ChunkReassembler _reassembler = new();
     private readonly SemaphoreSlim _txWindow = new(1, 1);
+    private readonly SemaphoreSlim _reconnectGate = new(1, 1);
     private readonly MeshtasticTxPriorityQueues _txQueues = new();
     private readonly ConcurrentDictionary<string, OutboxEntry> _outbox = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, int> _resendCounts = new(StringComparer.Ordinal);
@@ -37,7 +39,11 @@ public sealed class MeshatasticTransport : ITransport
     private Task? _sweepTask;
     private int _snapshotPending;
     private int _txPumpRunning;
+    private int _txInFlight;
+    private int _serialReconnectFailures;
     private bool _started;
+    /// <summary>UTC deadline while the TX pump yields for incomplete RX (re-enqueue path).</summary>
+    private DateTime _incompleteRxYieldDeadline;
 
     public MeshatasticTransport(MeshatasticTransportOptions options, ILogger? logger = null)
         : this(options, MeshtasticGate.Instance.CreateLink(options.ComPort, options.BaudRate, logger),
@@ -95,10 +101,29 @@ public sealed class MeshatasticTransport : ITransport
         _link.Received += OnLinkFrame;
         _started = true;
 
+        await ApplyConfiguredTxPowerAsync(cancellationToken).ConfigureAwait(false);
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _sweepTask = Task.Run(() => SweepLoopAsync(_cts.Token));
 
         QueueDirectorySnapshot();
+    }
+
+    /// <summary>Re-apply <see cref="MeshatasticTransportOptions.TxPowerDbm"/> to the board (REQ-RF-8).</summary>
+    public ValueTask ApplyConfiguredTxPowerAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_started || _link is not IMeshRadioConfig radio)
+            return ValueTask.CompletedTask;
+
+        var effective = LoRaTxPower.EffectiveForBoard(_options.TxPowerDbm, _options.Jurisdiction);
+        if (effective != _options.TxPowerDbm)
+            _logger?.LogInformation(
+                "TX power clamped for board: selected {Selected} dBm → {Effective} dBm (region {Region})",
+                _options.TxPowerDbm, effective, _options.Jurisdiction.Code);
+        else
+            _logger?.LogInformation("Applying Meshtastic TX power {Dbm} dBm", effective);
+
+        return radio.ApplyTxPowerDbmAsync(effective, cancellationToken);
     }
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)
@@ -187,6 +212,27 @@ public sealed class MeshatasticTransport : ITransport
     /// <summary>Inbound presence ping (frame 0x31): from node, to node, raw frame.</summary>
     public event Action<uint, uint, byte[]>? PresenceReceived;
 
+    /// <summary>
+    ///     True while a datagram (including a multi-chunk radio train) is on the air or waiting in
+    ///     the priority TX queues. Host presence / discovery should yield to this.
+    /// </summary>
+    public bool IsTxBusy =>
+        Volatile.Read(ref _txInFlight) != 0 || !_txQueues.IsEmpty;
+
+    /// <summary>Wait until TX queues and the current radio train drain, or until <paramref name="timeout"/>.</summary>
+    public async Task<bool> WaitForIdleAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (IsTxBusy)
+        {
+            if (DateTime.UtcNow >= deadline)
+                return !IsTxBusy;
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+
+        return true;
+    }
+
     /// <summary>Send one already-framed datagram (presence 0x31, directory, retry). Not a chat frame.</summary>
     public Task SendOpaqueAsync(uint node, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default) =>
         SendOpaqueAsync(node, payload, contentKind: null, cancellationToken);
@@ -270,6 +316,36 @@ public sealed class MeshatasticTransport : ITransport
                     continue;
                 }
 
+                // Half-duplex: defer non-retry TX while a peer chunk train is still arriving so we
+                // can hear mid-train chunks / send 0x33. Re-enqueue keeps the pump free for Control.
+                if (first != RetryRequestCodec.FrameByte &&
+                    ShouldDeferTxForIncompleteRx(DateTime.UtcNow))
+                {
+                    var slot = _options.IncompleteRxListenSlot;
+                    if (slot <= TimeSpan.Zero)
+                        slot = TimeSpan.FromMilliseconds(500);
+                    _logger?.LogDebug(
+                        "Deferring TX 0x{Frame:X2} — incomplete RX fresh; listen {Slot:0.0}s",
+                        first, slot.TotalSeconds);
+                    try
+                    {
+                        await Task.Delay(slot, item.CancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException oce)
+                    {
+                        item.Completion.TrySetCanceled(oce.CancellationToken);
+                        continue;
+                    }
+
+                    if (item.Completion.Task.IsCompleted)
+                        continue;
+                    _txQueues.Enqueue(item);
+                    continue;
+                }
+
+                if (!_reassembler.HasFreshIncomplete(DateTime.UtcNow, _options.IncompleteRxFreshWindow))
+                    _incompleteRxYieldDeadline = default;
+
                 try
                 {
                     await SendDatagramNowAsync(item.Node, item.Datagram, item.CancellationToken)
@@ -295,9 +371,28 @@ public sealed class MeshatasticTransport : ITransport
         }
     }
 
+    private bool ShouldDeferTxForIncompleteRx(DateTime now)
+    {
+        if (!_reassembler.HasFreshIncomplete(now, _options.IncompleteRxFreshWindow))
+        {
+            _incompleteRxYieldDeadline = default;
+            return false;
+        }
+
+        if (_incompleteRxYieldDeadline == default)
+        {
+            _incompleteRxYieldDeadline = now + _options.IncompleteRxYieldMax;
+            return true;
+        }
+
+        // Past the cap — send anyway so TX is not starved forever.
+        return now < _incompleteRxYieldDeadline;
+    }
+
     private async Task SendDatagramNowAsync(uint node, byte[] payload, CancellationToken cancellationToken)
     {
         await _txWindow.WaitAsync(cancellationToken).ConfigureAwait(false);
+        Interlocked.Exchange(ref _txInFlight, 1);
         try
         {
             var first = payload.Length > 0 ? payload[0] : (byte)0;
@@ -316,12 +411,16 @@ public sealed class MeshatasticTransport : ITransport
             var total = (ushort)((payload.Length + chunkDataSize - 1) / chunkDataSize);
             var frame = new byte[_options.MaxRadioPayloadBytes];
 
+            _logger?.LogInformation(
+                "LoRa TX chunk train start 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id})",
+                first, payload.Length, node, total, id);
             _logger?.LogTrace(
                 "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id}): {Hex}",
                 first, payload.Length, node, total, id, Convert.ToHexString(payload));
 
-            // Burst chunks back-to-back while holding the TX window so lower-priority work cannot
-            // interleave mid-datagram (duty-cycle deferral still applies per frame inside the gate).
+            // Hold the TX window for the whole train so lower-priority work cannot interleave
+            // mid-datagram; between chunks release the window + listen when incomplete RX is fresh
+            // so Control (0x33) can slip through and peer mid-train chunks can be heard.
             for (ushort number = 1; number <= total; number++)
             {
                 var offset = (number - 1) * chunkDataSize;
@@ -331,14 +430,40 @@ public sealed class MeshatasticTransport : ITransport
                     "LoRa TX chunk {Number}/{Total} ({Bytes} bytes) id {Id} → {Node:X8}: {Hex}",
                     number, total, written, id, node, Convert.ToHexString(frame.AsSpan(0, written)));
                 await SendFrameWithRetryAsync(node, frame.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
+                if (number < total)
+                    await ListenBetweenTrainChunksAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            _outbox[OutboxKey(node, id)] = new OutboxEntry(payload, node, DateTime.UtcNow);
+            var sentUtc = DateTime.UtcNow;
+            _outbox[OutboxKey(node, id)] = new OutboxEntry(payload, node, sentUtc, sentUtc);
+            _logger?.LogInformation(
+                "LoRa TX chunk train done id {Id} ({Total} chunks, {Bytes} bytes) → {Node:X8}",
+                id, total, payload.Length, node);
         }
         finally
         {
+            Interlocked.Exchange(ref _txInFlight, 0);
             _txWindow.Release();
         }
+    }
+
+    /// <summary>
+    ///     Between radio chunks of one datagram: brief listen window for peer RX. The TX window
+    ///     stays held so another datagram cannot interleave; duty-cycle gate already spaces TX.
+    /// </summary>
+    private async Task ListenBetweenTrainChunksAsync(CancellationToken cancellationToken)
+    {
+        if (!_reassembler.HasFreshIncomplete(DateTime.UtcNow, _options.IncompleteRxFreshWindow))
+            return;
+
+        var slot = _options.IncompleteRxListenSlot;
+        if (slot <= TimeSpan.Zero)
+            return;
+
+        _logger?.LogDebug(
+            "Chunk-train listen slot {Slot:0.0}s for incomplete RX",
+            slot.TotalSeconds);
+        await Task.Delay(slot, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task SendFrameWithRetryAsync(uint node, ReadOnlyMemory<byte> frame, CancellationToken cancellationToken)
@@ -355,6 +480,15 @@ public sealed class MeshatasticTransport : ITransport
             {
                 throw;
             }
+            catch (IOException ex) when (IsSerialClosed(ex))
+            {
+                _logger?.LogWarning(ex,
+                    "TX to {Node:X8} hit closed/unavailable serial; entering reconnect loop", node);
+                await EnsureSerialConnectedAsync(cancellationToken).ConfigureAwait(false);
+                // Reconnected: retry the same frame without burning the ordinary send budget.
+                if (attempt > 0)
+                    attempt--;
+            }
             catch (Exception ex) when (attempt < max)
             {
                 var delay = _options.Retry.SendDelay(attempt);
@@ -362,6 +496,78 @@ public sealed class MeshatasticTransport : ITransport
                     attempt + 1, delay);
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    private static bool IsSerialClosed(IOException ex)
+    {
+        var msg = ex.Message ?? "";
+        return msg.Contains("Serial port is closed", StringComparison.OrdinalIgnoreCase)
+               || msg.Contains("serial link is not started", StringComparison.OrdinalIgnoreCase)
+               || msg.Contains("serial link is stopped", StringComparison.OrdinalIgnoreCase)
+               || msg.Contains("device", StringComparison.OrdinalIgnoreCase) &&
+               (msg.Contains("unavailable", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("not available", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("access denied", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    ///     Reconnect until the board answers or the transport/send is cancelled.
+    ///     Backoff: 5 s for the first 10 failures, then logarithmic up to 30 s.
+    /// </summary>
+    private async Task EnsureSerialConnectedAsync(CancellationToken cancellationToken)
+    {
+        await _reconnectGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            while (_started)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (await TryReconnectSerialAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    _serialReconnectFailures = 0;
+                    return;
+                }
+
+                _serialReconnectFailures++;
+                var delay = SerialReconnectPolicy.DelayAfterFailures(_serialReconnectFailures);
+                _logger?.LogWarning(
+                    "Serial device unavailable (reconnect attempt {Attempt}); next try in {Delay}",
+                    _serialReconnectFailures, delay);
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+
+            throw new IOException("Meshtastic transport stopped during serial reconnect.");
+        }
+        finally
+        {
+            _reconnectGate.Release();
+        }
+    }
+
+    private async Task<bool> TryReconnectSerialAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _link.StopAsync(cancellationToken).ConfigureAwait(false);
+            await _link.StartAsync(cancellationToken).ConfigureAwait(false);
+            var node = _link.LocalNodeNumber;
+            if (node == null)
+            {
+                _logger?.LogWarning("Serial reconnect opened the port but board did not report a node number");
+                return false;
+            }
+
+            LocalMeshId = MeshId.FromNodeNumber(node.Value);
+            _logger?.LogInformation(
+                "Serial reconnected on node {Node} after {Failures} failed attempt(s)",
+                LocalMeshId.ToHex(), _serialReconnectFailures);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Serial reconnect attempt failed");
+            return false;
         }
     }
 
@@ -425,9 +631,13 @@ public sealed class MeshatasticTransport : ITransport
                 RequestResend(from, chunk.Id, RetryRequestCodec.ReasonInconsistentCrc);
                 break;
             case ChunkAddResult.NeedMore:
+                _logger?.LogDebug(
+                    "LoRa RX chunk {Number}/{Total} id {Id} from {From:X8} ({Bytes} bytes); waiting for remaining chunks",
+                    chunk.Number, chunk.Total, chunk.Id, from, bytes.Length);
                 _logger?.LogTrace(
-                    "LoRa RX chunk {Number}/{Total} id {Id} from {From:X8} ({Bytes} bytes): {Hex}",
-                    chunk.Number, chunk.Total, chunk.Id, from, bytes.Length, Convert.ToHexString(bytes));
+                    "LoRa RX chunk {Number}/{Total} id {Id} from {From:X8}: {Hex}",
+                    chunk.Number, chunk.Total, chunk.Id, from, Convert.ToHexString(bytes));
+                MaybeRequestGapResend(from, chunk.Id);
                 break;
             case ChunkAddResult.Duplicate:
             default:
@@ -472,6 +682,40 @@ public sealed class MeshatasticTransport : ITransport
         _ = PersistDirectoryAsync(CancellationToken.None);
     }
 
+    /// <summary>
+    ///     When mid-train holes are already visible (especially once the last chunk number arrived),
+    ///     request a full resend without waiting for the stall sweep — the missing chunks will not
+    ///     reappear spontaneously once the peer finished its train.
+    /// </summary>
+    private void MaybeRequestGapResend(uint fromNode, string compressedId)
+    {
+        var from = MeshId.FromNodeNumber(fromNode);
+        if (!_reassembler.TryGetProgress(from, compressedId, out var progress))
+            return;
+        if (!progress.HasGaps || progress.Missing <= 0)
+            return;
+
+        // Only when the last chunk number is already here: the peer train is finished and the
+        // missing mid-chunks will not arrive spontaneously. Mid-train holes wait for the
+        // GapAssemblyTimeout sweep so we do not TX 0x33 over remaining peer chunks.
+        if (!progress.HasLastChunk)
+            return;
+
+        var now = DateTime.UtcNow;
+        // Avoid spamming 0x33 on every late chunk of the same broken assembly.
+        var minGap = _options.Retry.GapAssemblyTimeout;
+        if (minGap < TimeSpan.FromSeconds(5))
+            minGap = TimeSpan.FromSeconds(5);
+        if (progress.RetryCount > 0 && now - progress.LastRetryUtc < minGap)
+            return;
+
+        _reassembler.NoteRetry(from, compressedId, now);
+        _logger?.LogInformation(
+            "LoRa RX gaps on id {Id} from {From:X8} (have {Received}/{Total}, last={HasLast}); requesting resend",
+            compressedId, fromNode, progress.Received, progress.Total, progress.HasLastChunk);
+        RequestResend(fromNode, compressedId, RetryRequestCodec.ReasonChunkTimeout);
+    }
+
     // ---- retry requests (0x33) ----
 
     private void RequestResend(uint fromNode, string compressedId, byte reason)
@@ -486,10 +730,10 @@ public sealed class MeshatasticTransport : ITransport
             return;
         }
 
-        var delay = _options.Retry.RxDelay(count - 1);
+        // Stall path is paced by SweepLoop (RxDelay); CRC / inconsistent are one-shot per assembly.
+        // Do not add a second Task.Delay here — that burned retry budget when callers re-entered early.
         _ = Task.Run(async () =>
         {
-            await Task.Delay(delay).ConfigureAwait(false);
             var request = RetryRequestCodec.Encode(MeshId.FromNodeNumber(fromNode), compressedId, reason, (byte)count);
             try
             {
@@ -529,12 +773,15 @@ public sealed class MeshatasticTransport : ITransport
             return;
         }
 
+        entry.LastActivityUtc = DateTime.UtcNow;
+
         _ = Task.Run(async () =>
         {
             try
             {
                 await SendDatagramAsync(fromNode, entry.Datagram, contentKind: null, CancellationToken.None)
                     .ConfigureAwait(false);
+                entry.LastActivityUtc = DateTime.UtcNow;
                 _logger?.LogInformation("Resent message ({Bytes} bytes) to {To:X8} on request", entry.Datagram.Length,
                     fromNode);
             }
@@ -558,23 +805,32 @@ public sealed class MeshatasticTransport : ITransport
                 // Control / short / medium text: duty-scaled RxTimeout (~141 s).
                 // Large text / binary (est. ≥ 1000 B, TX priorities 4–6): LargePayloadTimeout (180 s).
                 var retryCfg = _options.Retry;
-                foreach (var stalled in _reassembler.GetStalled(now, size => retryCfg.ChunkTimeoutForEstimatedSize(size)))
+                foreach (var stalled in _reassembler.GetStalled(now,
+                             (size, missing, received, hasGaps) =>
+                                 retryCfg.ChunkTimeoutForProgress(size, missing, received, hasGaps)))
                 {
                     if (!stalled.From.TryToNodeNumber(out var fromNode))
                     {
                         _reassembler.Drop(stalled.From, stalled.Id);
+                        _resendCounts.TryRemove(RetryKey(fromNode, stalled.Id), out _);
                         continue;
                     }
 
-                    var retry = _reassembler.NoteRetry(stalled.From, stalled.Id);
-                    if (retry > retryCfg.RxMaxRetries)
+                    if (stalled.RetryCount >= retryCfg.RxMaxRetries)
                     {
                         _reassembler.Drop(stalled.From, stalled.Id);
+                        _resendCounts.TryRemove(RetryKey(fromNode, stalled.Id), out _);
                         _logger?.LogWarning("Dropped stalled message {Id} from {From} after {Max} retries", stalled.Id,
-                            stalled.From.ToHex(), _options.Retry.RxMaxRetries);
+                            stalled.From.ToHex(), retryCfg.RxMaxRetries);
                         continue;
                     }
 
+                    // Pace stall resends with RxDelay(retry); do not burn budget on every 1s sweep tick.
+                    if (stalled.RetryCount > 0 &&
+                        now - stalled.LastRetryUtc < retryCfg.RxDelay(stalled.RetryCount - 1))
+                        continue;
+
+                    _reassembler.NoteRetry(stalled.From, stalled.Id, now);
                     RequestResend(fromNode, stalled.Id, RetryRequestCodec.ReasonChunkTimeout);
                 }
 
@@ -589,12 +845,15 @@ public sealed class MeshatasticTransport : ITransport
 
     private void PurgeOutbox(DateTime now)
     {
+        // Event-driven lifetime: drop after IdleGrace since last activity, with absolute Retention cap.
         foreach (var pair in _outbox)
-            if (now - pair.Value.SentUtc > _options.OutboxRetention)
+        {
+            var idle = now - pair.Value.LastActivityUtc > _options.OutboxIdleGrace;
+            var expired = now - pair.Value.SentUtc > _options.OutboxRetention;
+            if (idle || expired)
                 _outbox.TryRemove(pair.Key, out _);
-
-        foreach (var pair in _resendCounts)
-            _resendCounts.TryRemove(pair.Key, out _); // per-message budget restarts with a fresh message
+        }
+        // Do not wipe _resendCounts here — that reset the RX retry budget every sweep second.
     }
 
     // ---- directory snapshot sharing (0x32) ----
@@ -613,14 +872,27 @@ public sealed class MeshatasticTransport : ITransport
 
         _ = Task.Run(async () =>
         {
-            await Task.Delay(200).ConfigureAwait(false); // coalesce bursts
-            System.Threading.Interlocked.Exchange(ref _snapshotPending, 0);
             try
             {
+                // Yield to an active chunk train / queued chat TX so discovery does not split radio bursts.
+                for (var i = 0; i < 50 && IsTxBusy; i++)
+                    await Task.Delay(200).ConfigureAwait(false);
+                if (IsTxBusy)
+                {
+                    _logger?.LogInformation("Deferring directory snapshot — TX busy (chunk train / queues)");
+                    System.Threading.Interlocked.Exchange(ref _snapshotPending, 0);
+                    await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                    QueueDirectorySnapshot();
+                    return;
+                }
+
+                await Task.Delay(200).ConfigureAwait(false); // coalesce bursts
+                System.Threading.Interlocked.Exchange(ref _snapshotPending, 0);
                 await SendDirectorySnapshotAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
+                System.Threading.Interlocked.Exchange(ref _snapshotPending, 0);
                 _logger?.LogWarning(ex, "Failed to share the directory snapshot");
             }
         });
@@ -681,8 +953,15 @@ public sealed class MeshatasticTransport : ITransport
         if (_ownsLink)
             await _link.DisposeAsync().ConfigureAwait(false);
         _txWindow.Dispose();
+        _reconnectGate.Dispose();
         _channel.Writer.TryComplete();
     }
 
-    private sealed record OutboxEntry(byte[] Datagram, uint DestNode, DateTime SentUtc);
+    private sealed class OutboxEntry(byte[] datagram, uint destNode, DateTime sentUtc, DateTime lastActivityUtc)
+    {
+        public byte[] Datagram { get; } = datagram;
+        public uint DestNode { get; } = destNode;
+        public DateTime SentUtc { get; } = sentUtc;
+        public DateTime LastActivityUtc { get; set; } = lastActivityUtc;
+    }
 }

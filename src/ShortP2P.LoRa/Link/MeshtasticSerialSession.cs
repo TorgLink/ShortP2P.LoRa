@@ -31,6 +31,9 @@ internal sealed class MeshtasticSerialSession
     private bool _hasLocalNode;
     private DateTime _nextAnnounceRetryUtc = DateTime.MaxValue;
     private DateTime _nextRefreshRetryUtc = DateTime.MaxValue;
+    private byte[] _adminPasskey = [];
+    private int? _pendingTxPowerDbm;
+    private TaskCompletionSource<bool>? _txPowerWait;
 
     /// <summary>Raw board frames (raised on the radio thread).</summary>
     internal event Action<MeshLinkFrame>? Received;
@@ -119,6 +122,47 @@ internal sealed class MeshtasticSerialSession
         var framed = MeshtasticProto.Frame(
             MeshtasticProto.BuildToRadioPacket(to, NextPacketId(), payload.ToArray(), hopLimit: 3));
         WriteRaw(framed);
+    }
+
+    /// <summary>
+    ///     Set Config.LoRaConfig.tx_power on the local board (REQ-RF-8). Completes when the set is
+    ///     written (after fetching session_passkey when the firmware requires it).
+    /// </summary>
+    internal void BeginApplyTxPower(int txPowerDbm, TaskCompletionSource<bool> done)
+    {
+        EnsureOwner();
+        if (_port is not { IsOpen: true } || !_hasLocalNode)
+        {
+            done.TrySetResult(false);
+            return;
+        }
+
+        _txPowerWait?.TrySetResult(false);
+        _txPowerWait = done;
+        _pendingTxPowerDbm = txPowerDbm;
+
+        // Older firmware accepts set_config without a passkey; newer FW needs session_passkey from
+        // an admin response — request LORA config, then rewrite when the key arrives.
+        WriteTxPowerConfig(txPowerDbm, completeWait: _adminPasskey.Length > 0);
+        if (_adminPasskey.Length > 0)
+            return;
+
+        try
+        {
+            var admin = MeshtasticProto.BuildAdminGetLoraConfig();
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            Logger?.LogDebug("Requested LoRa config from board to obtain admin session passkey");
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to request LoRa config for TX power apply");
+            done.TrySetResult(false);
+            _txPowerWait = null;
+            _pendingTxPowerDbm = null;
+        }
     }
 
     /// <summary>
@@ -334,6 +378,17 @@ internal sealed class MeshtasticSerialSession
                 {
                     if (id == _refreshWaitId)
                         _refreshWait?.TrySetResult(true);
+                },
+                onAdminPayload: admin =>
+                {
+                    if (MeshtasticProto.TryReadAdminSessionPasskey(admin, out var key))
+                    {
+                        _adminPasskey = key;
+                        changed = true;
+                    }
+
+                    if (_pendingTxPowerDbm is int dbm)
+                        WriteTxPowerConfig(dbm, completeWait: true);
                 });
             return changed;
         }
@@ -341,6 +396,33 @@ internal sealed class MeshtasticSerialSession
         {
             Logger?.LogWarning(ex, "Failed to parse a FromRadio payload ({Len} bytes)", payload.Length);
             return false;
+        }
+    }
+
+    private void WriteTxPowerConfig(int txPowerDbm, bool completeWait)
+    {
+        try
+        {
+            var admin = MeshtasticProto.BuildAdminSetLoraTxPower(txPowerDbm, _adminPasskey);
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            Logger?.LogInformation(
+                "Meshtastic TX power set to {Dbm} dBm (passkey={HasKey})",
+                txPowerDbm, _adminPasskey.Length > 0);
+            if (!completeWait)
+                return;
+            _pendingTxPowerDbm = null;
+            _txPowerWait?.TrySetResult(true);
+            _txPowerWait = null;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to set Meshtastic TX power to {Dbm} dBm", txPowerDbm);
+            _pendingTxPowerDbm = null;
+            _txPowerWait?.TrySetResult(false);
+            _txPowerWait = null;
         }
     }
 

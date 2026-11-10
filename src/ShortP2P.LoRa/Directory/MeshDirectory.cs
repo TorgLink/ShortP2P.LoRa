@@ -120,6 +120,37 @@ public sealed class MeshDirectory
         }
     }
 
+    /// <summary>
+    ///     Resolve the current NetworkId owner of a MeshId (radio / link layer → subscriber layer).
+    ///     Prefers a confirmed active binding; does not treat MeshId as NetworkId.
+    /// </summary>
+    public bool TryGetOwnerNetworkId(MeshId meshId, out byte[] networkIdWire12, out bool confirmed)
+    {
+        networkIdWire12 = [];
+        confirmed = false;
+        var meshKey = MeshKey(meshId.Bytes.ToArray());
+        lock (_sync)
+        {
+            MeshBinding? best = null;
+            foreach (var b in _bindings.Values)
+            {
+                if (!b.IsActive || MeshKey(b.MeshId) != meshKey)
+                    continue;
+                if (best == null ||
+                    (b.Confirmed && !best.Confirmed) ||
+                    (b.Confirmed == best.Confirmed && b.LastSeenUtc > best.LastSeenUtc))
+                    best = b;
+            }
+
+            if (best == null)
+                return false;
+
+            networkIdWire12 = (byte[])best.NetworkId.Clone();
+            confirmed = best.Confirmed;
+            return true;
+        }
+    }
+
     /// <summary>All active bindings of peers and servers (snapshot unicast targets, REQ-DIR-4).</summary>
     public IReadOnlyList<MeshBinding> GetActiveRemoteBindings()
     {
