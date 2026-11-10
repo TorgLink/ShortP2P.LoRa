@@ -338,7 +338,9 @@ internal sealed class MeshtasticSerialSession
                 payload,
                 onPacket: frame =>
                 {
-                    Logger?.LogTrace(
+                    // Information: empty "LoRa serial RX" in normal host logs previously looked like
+                    // zero RF because PrivateApp RX was only LogTrace.
+                    Logger?.LogInformation(
                         "LoRa serial RX ← {From:X8} to {To:X8}, payload {Len} bytes (first=0x{First:X2}): {Hex}",
                         frame.From, frame.To, frame.Payload.Length,
                         frame.Payload.Length > 0 ? frame.Payload[0] : 0,
@@ -401,6 +403,12 @@ internal sealed class MeshtasticSerialSession
                                 admin.Length);
                         }
                     }
+                },
+                onSkippedPacket: (from, to, port, reason) =>
+                {
+                    Logger?.LogInformation(
+                        "LoRa serial MeshPacket skipped ← {From:X8} to {To:X8}, port={Port}: {Reason}",
+                        from, to, port?.ToString() ?? "-", reason);
                 });
             return changed;
         }

@@ -190,16 +190,21 @@ internal static class MeshtasticProto
     ///     Parse a FromRadio payload. Handles packet, my_info, node_info (field 4) and
     ///     config_complete_id (field 7) from the Meshtastic mesh protobufs.
     /// </summary>
+    /// <param name="onSkippedPacket">
+    ///     Fired for MeshPackets that are not delivered as PrivateApp (encrypted-only, other portnum, empty payload).
+    ///     Useful to distinguish "no RF on serial" from "RF present but not PrivateApp".
+    /// </param>
     public static void ReadFromRadio(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket,
         Action<uint>? onMyNodeNum, Action<MeshtasticRadioNode>? onNode = null, Action<uint>? onConfigComplete = null,
-        Action<byte[]>? onAdminPayload = null)
+        Action<byte[]>? onAdminPayload = null,
+        Action<uint, uint, uint?, string>? onSkippedPacket = null)
     {
         ReadFields(payload, (number, wireType, varint, bytes) =>
         {
             switch (number)
             {
                 case 2 when wireType == 2:
-                    TryReadMeshPacket(bytes, onPacket, onAdminPayload);
+                    TryReadMeshPacket(bytes, onPacket, onAdminPayload, onSkippedPacket);
                     break;
                 case 3 when wireType == 2:
                     TryReadMyNodeInfo(bytes, onMyNodeNum);
@@ -215,10 +220,11 @@ internal static class MeshtasticProto
     }
 
     private static void TryReadMeshPacket(ReadOnlySpan<byte> payload, Action<MeshLinkFrame>? onPacket,
-        Action<byte[]>? onAdminPayload = null)
+        Action<byte[]>? onAdminPayload = null, Action<uint, uint, uint?, string>? onSkipped = null)
     {
         uint from = 0, to = 0;
         byte[]? decoded = null;
+        var hasEncrypted = false;
 
         ReadFields(payload, (number, wireType, _, bytes) =>
         {
@@ -233,11 +239,19 @@ internal static class MeshtasticProto
                 case (4, 2):
                     decoded = bytes.ToArray();
                     break;
+                case (5, 2):
+                    // MeshPacket.encrypted — board could not (or did not) decrypt for this client.
+                    hasEncrypted = true;
+                    break;
             }
         });
 
         if (decoded == null)
+        {
+            if (hasEncrypted)
+                onSkipped?.Invoke(from, to, null, "encrypted-only (no decoded) — channel/PSK mismatch or not for us");
             return;
+        }
 
         uint? portNumber = null;
         byte[]? data = null;
@@ -255,7 +269,10 @@ internal static class MeshtasticProto
         });
 
         if (data is not { Length: > 0 })
+        {
+            onSkipped?.Invoke(from, to, portNumber, "decoded Data with empty payload");
             return;
+        }
 
         if (portNumber == PortNumAdminApp)
         {
@@ -264,7 +281,15 @@ internal static class MeshtasticProto
         }
 
         if (portNumber == PortNumPrivateApp && from != 0)
+        {
             onPacket?.Invoke(new MeshLinkFrame(from, to, data));
+            return;
+        }
+
+        onSkipped?.Invoke(from, to, portNumber,
+            portNumber == PortNumPrivateApp
+                ? "PrivateApp with from=0"
+                : $"portnum={portNumber?.ToString() ?? "missing"} (not PrivateApp {PortNumPrivateApp})");
     }
 
     private static void TryReadMyNodeInfo(ReadOnlySpan<byte> payload, Action<uint>? onMyNodeNum)
