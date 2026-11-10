@@ -74,19 +74,18 @@ internal static class MeshtasticProto
     }
 
     /// <summary>
-    ///     AdminMessage.set_config with Config.lora.tx_power only (field numbers from meshtastic protobufs).
+    ///     AdminMessage.set_config with a full Config.lora blob (must preserve modem/region/channel).
+    ///     Never send a LoRaConfig that contains only tx_power — firmware replaces the whole section.
     /// </summary>
-    public static byte[] BuildAdminSetLoraTxPower(int txPowerDbm, ReadOnlySpan<byte> sessionPasskey)
+    public static byte[] BuildAdminSetLoraConfig(ReadOnlySpan<byte> loraConfig, ReadOnlySpan<byte> sessionPasskey)
     {
-        using var lora = new MemoryStream();
-        WriteVarint(lora, (10 << 3) | 0); // tx_power
-        WriteVarint(lora, unchecked((uint)txPowerDbm));
+        if (loraConfig.Length == 0)
+            throw new ArgumentException("LoRaConfig bytes are required.", nameof(loraConfig));
 
-        var loraBytes = lora.ToArray();
         using var config = new MemoryStream();
         WriteVarint(config, (6 << 3) | 2); // Config.lora
-        WriteVarint(config, (uint)loraBytes.Length);
-        config.Write(loraBytes, 0, loraBytes.Length);
+        WriteVarint(config, (uint)loraConfig.Length);
+        config.Write(loraConfig);
 
         var configBytes = config.ToArray();
         using var admin = new MemoryStream();
@@ -103,6 +102,32 @@ internal static class MeshtasticProto
         return admin.ToArray();
     }
 
+    /// <summary>
+    ///     Copy an existing LoRaConfig protobuf and replace/add tx_power (field 10).
+    ///     Other fields (region, modem, channel_num, …) stay intact.
+    /// </summary>
+    public static byte[] PatchLoRaConfigTxPower(ReadOnlySpan<byte> loraConfig, int txPowerDbm)
+    {
+        using var ms = new MemoryStream(loraConfig.Length + 8);
+        var o = 0;
+        while (o < loraConfig.Length)
+        {
+            var fieldStart = o;
+            if (!TryReadVarint(loraConfig, ref o, out var tag))
+                break;
+            var number = (int)(tag >> 3);
+            var wire = (int)(tag & 7);
+            if (!TrySkipFieldValue(loraConfig, ref o, wire))
+                break;
+            if (number != 10)
+                ms.Write(loraConfig[fieldStart..o]);
+        }
+
+        WriteVarint(ms, (10 << 3) | 0); // tx_power
+        WriteVarint(ms, unchecked((uint)txPowerDbm));
+        return ms.ToArray();
+    }
+
     /// <summary>Extract AdminMessage.session_passkey (field 101) when present.</summary>
     public static bool TryReadAdminSessionPasskey(ReadOnlySpan<byte> adminPayload, out byte[] passkey)
     {
@@ -116,6 +141,33 @@ internal static class MeshtasticProto
         if (found == null)
             return false;
         passkey = found;
+        return true;
+    }
+
+    /// <summary>
+    ///     AdminMessage.get_config_response (field 6) → Config.lora (field 6) raw bytes.
+    /// </summary>
+    public static bool TryReadAdminGetConfigResponseLora(ReadOnlySpan<byte> adminPayload, out byte[] loraConfig)
+    {
+        loraConfig = [];
+        byte[]? configBytes = null;
+        ReadFields(adminPayload, (number, wireType, _, bytes) =>
+        {
+            if (number == 6 && wireType == 2 && bytes.Length > 0)
+                configBytes = bytes.ToArray();
+        });
+        if (configBytes == null)
+            return false;
+
+        byte[]? lora = null;
+        ReadFields(configBytes, (number, wireType, _, bytes) =>
+        {
+            if (number == 6 && wireType == 2 && bytes.Length > 0)
+                lora = bytes.ToArray();
+        });
+        if (lora == null)
+            return false;
+        loraConfig = lora;
         return true;
     }
 
@@ -307,6 +359,32 @@ internal static class MeshtasticProto
                 default:
                     return;
             }
+        }
+    }
+
+    private static bool TrySkipFieldValue(ReadOnlySpan<byte> data, ref int offset, int wireType)
+    {
+        switch (wireType)
+        {
+            case 0:
+                return TryReadVarint(data, ref offset, out _);
+            case 1:
+                if (offset + 8 > data.Length)
+                    return false;
+                offset += 8;
+                return true;
+            case 2:
+                if (!TryReadVarint(data, ref offset, out var len) || offset + len > data.Length)
+                    return false;
+                offset += (int)len;
+                return true;
+            case 5:
+                if (offset + 4 > data.Length)
+                    return false;
+                offset += 4;
+                return true;
+            default:
+                return false;
         }
     }
 
