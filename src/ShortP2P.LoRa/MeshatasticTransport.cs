@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using ShortP2P.LoRa.Chunking;
 using ShortP2P.LoRa.Directory;
+using ShortP2P.LoRa.Jurisdiction;
 using ShortP2P.LoRa.Link;
 using ShortP2P.LoRa.Reliability;
 using ShortP2P.Transport.Abstractions;
@@ -100,10 +101,29 @@ public sealed class MeshatasticTransport : ITransport
         _link.Received += OnLinkFrame;
         _started = true;
 
+        await ApplyConfiguredTxPowerAsync(cancellationToken).ConfigureAwait(false);
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _sweepTask = Task.Run(() => SweepLoopAsync(_cts.Token));
 
         QueueDirectorySnapshot();
+    }
+
+    /// <summary>Re-apply <see cref="MeshatasticTransportOptions.TxPowerDbm"/> to the board (REQ-RF-8).</summary>
+    public ValueTask ApplyConfiguredTxPowerAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_started || _link is not IMeshRadioConfig radio)
+            return ValueTask.CompletedTask;
+
+        var effective = LoRaTxPower.EffectiveForBoard(_options.TxPowerDbm, _options.Jurisdiction);
+        if (effective != _options.TxPowerDbm)
+            _logger?.LogInformation(
+                "TX power clamped for board: selected {Selected} dBm → {Effective} dBm (region {Region})",
+                _options.TxPowerDbm, effective, _options.Jurisdiction.Code);
+        else
+            _logger?.LogInformation("Applying Meshtastic TX power {Dbm} dBm", effective);
+
+        return radio.ApplyTxPowerDbmAsync(effective, cancellationToken);
     }
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)

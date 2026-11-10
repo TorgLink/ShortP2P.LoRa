@@ -19,6 +19,12 @@ public sealed record MeshatasticTransportOptions
     /// <summary>Selected jurisdiction. Default UNSET — TX is allowed at the 10% default duty cycle (REQ-RF-2).</summary>
     public JurisdictionProfile Jurisdiction { get; init; } = JurisdictionCatalog.Unset;
 
+    /// <summary>
+    ///     Desired TX power in dBm for the board (REQ-RF-8). UI range is 5…22; the host clamps to the
+    ///     region cap before apply. Default 22.
+    /// </summary>
+    public int TxPowerDbm { get; init; } = LoRaTxPower.MaxDbm;
+
     public RetryConfig Retry { get; init; } = new();
 
     /// <summary>Local ShortP2P NetworkId, 12-byte wire form. Set before start.</summary>

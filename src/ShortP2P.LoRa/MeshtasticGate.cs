@@ -172,6 +172,42 @@ public sealed class MeshtasticGate
         return done.Task.WaitAsync(cancellationToken);
     }
 
+    /// <summary>Apply Config.LoRaConfig.tx_power on the open session (REQ-RF-8).</summary>
+    internal async Task ApplyTxPowerAsync(object token, int txPowerDbm, CancellationToken cancellationToken)
+    {
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commands.Add(() =>
+        {
+            try
+            {
+                var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+                if (session == null)
+                {
+                    done.TrySetResult(false);
+                    return;
+                }
+
+                session.BeginApplyTxPower(txPowerDbm, done);
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await done.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Passkey never arrived; the first set_config without key may still have applied.
+            done.TrySetResult(true);
+        }
+    }
+
     /// <summary>
     ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
     ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.
