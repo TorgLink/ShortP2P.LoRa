@@ -8,6 +8,8 @@ public class MeshtasticNodeInfoTests
     [Fact]
     public void ReadFromRadio_ParsesNodeInfoAndConfigComplete()
     {
+        // Goal: ReadFromRadio extracts NodeInfo fields and config_complete_id from protobuf bytes.
+        // Expected: node num 0x11, long name "AB", NodeId "!00000011"; config complete id = 5.
         // FromRadio.node_info: NodeInfo.num = 0x11, User.long_name = "AB"
         // 22 08 | 08 11 | 12 04 | 12 02 41 42
         byte[] nodeInfo =

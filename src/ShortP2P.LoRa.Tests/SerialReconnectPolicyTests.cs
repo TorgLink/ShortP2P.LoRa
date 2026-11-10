@@ -11,12 +11,16 @@ public class SerialReconnectPolicyTests
     [InlineData(10)]
     public void First_Ten_Failures_Use_Fixed_Five_Seconds(int failedAttempts)
     {
+        // Goal: early reconnect failures use a fixed short delay.
+        // Expected: DelayAfterFailures(1..10) == 5 seconds.
         Assert.Equal(TimeSpan.FromSeconds(5), SerialReconnectPolicy.DelayAfterFailures(failedAttempts));
     }
 
     [Fact]
     public void Beyond_Ten_Failures_Grows_Logarithmically_Up_To_Thirty_Seconds()
     {
+        // Goal: after ten failures the delay grows monotonically and caps at 30 s.
+        // Expected: attempt 10 → 5 s; attempts 11..80 never drop, stay in [5,30], attempt 80 → 30 s.
         var prev = SerialReconnectPolicy.DelayAfterFailures(10);
         Assert.Equal(TimeSpan.FromSeconds(5), prev);
 

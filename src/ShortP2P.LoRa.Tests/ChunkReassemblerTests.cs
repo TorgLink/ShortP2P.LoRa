@@ -15,6 +15,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void OutOfOrder_Chunks_Assemble()
     {
+        // Goal: reassembler accepts chunks out of order and builds the original datagram.
+        // Expected: NeedMore until the last missing piece; then Completed with bytes {10,20,30,40,50}.
         var datagram = new byte[] { 10, 20, 30, 40, 50 };
         var crc = Crc32.Compute(datagram);
         var r = new ChunkReassembler();
@@ -33,6 +35,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void FullSet_With_Bad_Crc_Is_Reported()
     {
+        // Goal: a complete set whose payload does not match the advertised CRC is rejected.
+        // Expected: final Add returns CrcMismatch.
         var r = new ChunkReassembler();
         var now = DateTime.UtcNow;
         var crc = Crc32.Compute([1, 2, 3, 4]);
@@ -47,6 +51,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void Inconsistent_Crc_Between_Chunks_Discards_Set()
     {
+        // Goal: chunks of one id that advertise different CRCs are treated as a corrupt set.
+        // Expected: second Add returns Inconsistent.
         var datagram = new byte[] { 1, 2 };
         var crc = Crc32.Compute(datagram);
         var r = new ChunkReassembler();
@@ -62,6 +68,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void Stalled_Assembly_Is_Reported_And_Can_Be_Dropped()
     {
+        // Goal: incomplete assemblies become stalled after the timeout, survive NoteRetry, and clear on Drop.
+        // Expected: empty at +5 s; one stalled at +11 s; NoteRetry increments count without clearing; Drop empties the set.
         var r = new ChunkReassembler();
         var t0 = DateTime.UtcNow;
         r.Add(From, MakeChunk("sT0001", 1, 3, 0x1234, 9), t0, out _);
@@ -83,6 +91,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void Stalled_Uses_Size_Based_Timeout_Selector()
     {
+        // Goal: stall detection uses a size-based timeout selector for large estimated payloads.
+        // Expected: not stalled at +150 s with 180 s large timeout; stalled at +181 s for id Lg0001.
         var r = new ChunkReassembler();
         var t0 = DateTime.UtcNow;
         // One 500-byte chunk of 3 → estimate 500 + 2*500 = 1500 (≥ large band)
@@ -100,6 +110,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void Stalled_Partial_Assembly_Uses_Progress_Timeout()
     {
+        // Goal: partial assemblies with missing chunks use a shorter progress timeout than full RxTimeout.
+        // Expected: empty at +40 s; stalled at +46 s for id BEHDiT when progress timeout is 45 s.
         var r = new ChunkReassembler();
         var t0 = DateTime.UtcNow;
         // Last chunk of 2 arrived; first is missing — accelerate resend vs full RxTimeout.
@@ -119,6 +131,8 @@ public class ChunkReassemblerTests
     [Fact]
     public void MidTrain_Holes_Report_Progress_And_Fresh_Incomplete()
     {
+        // Goal: mid-train holes expose progress/gaps and drive faster stall + fresh-incomplete windows.
+        // Expected: HasFreshIncomplete true within 22 s then false; progress 4/7 with gaps; stall after gap timeout 18 s.
         var r = new ChunkReassembler();
         var t0 = DateTime.UtcNow;
         // Vt3Mi0-style: 1, then 5..7 — holes at 2..4, last present.

@@ -8,6 +8,8 @@ public class DutyCycleBudgetTests
     [Fact]
     public void Even_Pacing_Defers_Before_Hourly_Budget_Is_Exhausted()
     {
+        // Goal: verify even airtime pacing delays a second frame while the rolling window still has headroom.
+        // Expected: first frame waits 0; after recording 1 s airtime, the next frame waits ~10 s and spent stays well under half the budget.
         // 10% of 100 s window → 10 s airtime budget; 10 ms/byte → 100 bytes = 1 s airtime.
         var budget = new DutyCycleBudget(
             dutyCyclePercent: 10,
@@ -33,6 +35,8 @@ public class DutyCycleBudgetTests
     [Fact]
     public void After_Pace_Wait_Frame_Is_Allowed_Again()
     {
+        // Goal: confirm that once the pace wait elapses, the next frame is allowed immediately.
+        // Expected: wait > 0 at t0 after first TX; at t0+wait WaitTimeFor is Zero and a second RecordTx raises spent above 1.5 s.
         var budget = new DutyCycleBudget(
             dutyCyclePercent: 10,
             window: TimeSpan.FromSeconds(100),
@@ -57,6 +61,8 @@ public class DutyCycleBudgetTests
     [Fact]
     public void Rolling_Hour_Hard_Cap_Still_Applies()
     {
+        // Goal: ensure burst credit cannot bypass the hard rolling-window airtime cap.
+        // Expected: ten 1 s frames at t0 succeed, then WaitTimeFor returns a large hard-cap wait (> 50 s).
         var budget = new DutyCycleBudget(
             dutyCyclePercent: 10,
             window: TimeSpan.FromSeconds(100),
@@ -80,6 +86,8 @@ public class DutyCycleBudgetTests
     [Fact]
     public void Oversized_Lone_Frame_Is_Never_Parked_Forever()
     {
+        // Goal: a single frame larger than the window budget must still be allowed once (no permanent park).
+        // Expected: WaitTimeFor(2000 bytes) at t0 returns TimeSpan.Zero even with zero burst credit.
         var budget = new DutyCycleBudget(
             dutyCyclePercent: 10,
             window: TimeSpan.FromSeconds(100),
