@@ -217,6 +217,14 @@ public sealed class MeshatasticTransport : ITransport
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)
     {
+        // Let an in-flight chunk train / duty wait finish before tearing down the COM session.
+        // Host StopCore also waits; this is the last line of defense for direct Stop/Dispose.
+        if (!await WaitForIdleAsync(TimeSpan.FromSeconds(45), cancellationToken).ConfigureAwait(false))
+        {
+            _logger?.LogWarning(
+                "Meshatastic transport stop while TX still busy after idle wait");
+        }
+
         _started = false;
         _link.Received -= OnLinkFrame;
 
@@ -293,6 +301,13 @@ public sealed class MeshatasticTransport : ITransport
     /// <summary>Ask the board to resend its node database (want_config) and wait until it finishes.</summary>
     public ValueTask RefreshRadioNodesAsync(CancellationToken cancellationToken = default)
     {
+        // want_config floods the serial pipe and clears the node DB; never start it mid chat TX.
+        if (IsTxBusy)
+        {
+            _logger?.LogInformation("Skipping want_config / node refresh — TX busy (chunk train / queues)");
+            return ValueTask.CompletedTask;
+        }
+
         if (_link is IMeshNodeCatalog catalog)
             return catalog.RefreshAsync(cancellationToken);
         return ValueTask.CompletedTask;
@@ -507,14 +522,15 @@ public sealed class MeshatasticTransport : ITransport
                 "LoRa TX frame 0x{Frame:X2} ({Bytes} bytes) → {Node:X8} as {Total} radio chunks (id {Id}): {Hex}",
                 first, payload.Length, node, total, id, Convert.ToHexString(payload));
 
-            // Even-pace the whole train first (earn airtime uniformly), then spend it as one burst.
-            // Mid-chunk pace waits would stretch trains over ~10 s/chunk and break reassembly.
+            // Even-pace the whole train first (earn airtime uniformly), then spend it with short
+            // inter-chunk listen gaps. Mid-chunk duty waits would stretch trains and break reassembly;
+            // fixed gaps keep the peer able to hear without re-earning budget per frame.
             var trainAirtimeBytes = EstimateChunkTrainAirtimeBytes(payload.Length, chunkDataSize, total);
             await _link.WaitForDutyBudgetAsync(trainAirtimeBytes, cancellationToken).ConfigureAwait(false);
 
             // Hold the TX window for the whole train so lower-priority work cannot interleave
-            // mid-datagram; between chunks release the window + listen when incomplete RX is fresh
-            // so Control (0x33) can slip through and peer mid-train chunks can be heard.
+            // mid-datagram; between chunks always pause briefly (and longer when incomplete RX is
+            // fresh) so peer mid-train chunks / Control (0x33) can be heard.
             for (ushort number = 1; number <= total; number++)
             {
                 var offset = (number - 1) * chunkDataSize;
@@ -563,21 +579,31 @@ public sealed class MeshatasticTransport : ITransport
     }
 
     /// <summary>
-    ///     Between radio chunks of one datagram: brief listen window for peer RX. The TX window
-    ///     stays held so another datagram cannot interleave; train airtime was already even-paced.
+    ///     Between radio chunks of one datagram: always a short half-duplex listen gap; longer when
+    ///     incomplete RX is fresh. TX window stays held so another datagram cannot interleave;
+    ///     train airtime was already even-paced.
     /// </summary>
     private async Task ListenBetweenTrainChunksAsync(CancellationToken cancellationToken)
     {
-        if (!_reassembler.HasFreshIncomplete(DateTime.UtcNow, _options.IncompleteRxFreshWindow))
-            return;
+        var slot = _options.ChunkTrainInterChunkGap;
+        if (_reassembler.HasFreshIncomplete(DateTime.UtcNow, _options.IncompleteRxFreshWindow)
+            && _options.IncompleteRxListenSlot > slot)
+        {
+            slot = _options.IncompleteRxListenSlot;
+            _logger?.LogDebug(
+                "Chunk-train listen slot {Slot:0.0}s for incomplete RX",
+                slot.TotalSeconds);
+        }
+        else if (slot > TimeSpan.Zero)
+        {
+            _logger?.LogTrace(
+                "Chunk-train inter-chunk gap {Slot:0.000}s",
+                slot.TotalSeconds);
+        }
 
-        var slot = _options.IncompleteRxListenSlot;
         if (slot <= TimeSpan.Zero)
             return;
 
-        _logger?.LogDebug(
-            "Chunk-train listen slot {Slot:0.0}s for incomplete RX",
-            slot.TotalSeconds);
         await Task.Delay(slot, cancellationToken).ConfigureAwait(false);
     }
 
@@ -895,19 +921,83 @@ public sealed class MeshatasticTransport : ITransport
 
         entry.LastActivityUtc = DateTime.UtcNow;
 
+        // One outstanding outbox resend per entry — peer 0x33 storms must not queue N× invite trains.
+        if (Interlocked.CompareExchange(ref entry.ResendInFlight, 1, 0) != 0)
+        {
+            _logger?.LogInformation(
+                "Coalescing resend of {Id} to {To:X8} — already queued/in flight", id, fromNode);
+            return;
+        }
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await SendDatagramAsync(fromNode, entry.Datagram, contentKind: null, CancellationToken.None)
+                var now = DateTime.UtcNow;
+                var datagram = entry.Datagram;
+                var heavyControl = datagram.Length > 0 && datagram[0] == 0x30
+                                   && datagram.Length > _options.MaxRadioPayloadBytes;
+
+                // Heavy invite trains: do not pile onto incomplete RX / short resend intervals /
+                // a long duty wait — that is what flooded the queue in the field logs.
+                if (heavyControl)
+                {
+                    if (ShouldDeferTxForIncompleteRx(now))
+                    {
+                        _logger?.LogInformation(
+                            "Skipping heavy 0x30 resend of {Id} to {To:X8} — incomplete RX listen window",
+                            id, fromNode);
+                        return;
+                    }
+
+                    var minGap = _options.Retry.GapAssemblyTimeout;
+                    if (minGap < TimeSpan.FromSeconds(8))
+                        minGap = TimeSpan.FromSeconds(8);
+                    if (entry.LastResendQueuedUtc != default
+                        && now - entry.LastResendQueuedUtc < minGap)
+                    {
+                        _logger?.LogInformation(
+                            "Rate-limiting heavy 0x30 resend of {Id} to {To:X8} (min gap {Gap:0.0}s)",
+                            id, fromNode, minGap.TotalSeconds);
+                        return;
+                    }
+
+                    if (_ownsLink)
+                    {
+                        try
+                        {
+                            var wait = await MeshtasticGate.Instance
+                                .PeekDutyWaitAsync(datagram.Length, CancellationToken.None)
+                                .ConfigureAwait(false);
+                            if (wait > TimeSpan.FromSeconds(10))
+                            {
+                                _logger?.LogInformation(
+                                    "Skipping heavy 0x30 resend of {Id} to {To:X8} — duty wait {Seconds:F0}s",
+                                    id, fromNode, wait.TotalSeconds);
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogDebug(ex, "Duty peek before 0x30 resend failed; continuing");
+                        }
+                    }
+                }
+
+                entry.LastResendQueuedUtc = DateTime.UtcNow;
+                await SendDatagramAsync(fromNode, datagram, contentKind: null, CancellationToken.None)
                     .ConfigureAwait(false);
                 entry.LastActivityUtc = DateTime.UtcNow;
-                _logger?.LogInformation("Resent message ({Bytes} bytes) to {To:X8} on request", entry.Datagram.Length,
+                _logger?.LogInformation("Resent message ({Bytes} bytes) to {To:X8} on request", datagram.Length,
                     fromNode);
             }
             catch (Exception ex)
             {
                 _logger?.LogWarning(ex, "Resend to {To:X8} failed", fromNode);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref entry.ResendInFlight, 0);
             }
         });
     }
@@ -1083,5 +1173,7 @@ public sealed class MeshatasticTransport : ITransport
         public uint DestNode { get; } = destNode;
         public DateTime SentUtc { get; } = sentUtc;
         public DateTime LastActivityUtc { get; set; } = lastActivityUtc;
+        public DateTime LastResendQueuedUtc;
+        public int ResendInFlight;
     }
 }

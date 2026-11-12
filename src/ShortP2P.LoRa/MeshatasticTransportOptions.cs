@@ -67,6 +67,12 @@ public sealed record MeshatasticTransportOptions
     public TimeSpan RxSweepInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    ///     Always pause at least this long between radio chunks of one datagram so the peer can
+    ///     hear / ACK mid-train (half-duplex). Default 250 ms.
+    /// </summary>
+    public TimeSpan ChunkTrainInterChunkGap { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
     ///     While an incomplete RX assembly is fresh, pause between TX radio frames for this long
     ///     so half-duplex can hear the peer's remaining chunks. Default 3 s.
     /// </summary>

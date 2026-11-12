@@ -14,6 +14,8 @@ internal sealed class MeshtasticSerialSession
 {
     private const int AnnounceRetrySeconds = 1;
     private const int RefreshRetrySeconds = 2;
+    /// <summary>Quiet window after a mesh TX before want_config retries (serial contention).</summary>
+    private static readonly TimeSpan WantConfigQuietAfterMeshTx = TimeSpan.FromSeconds(5);
     private const int SerialHeaderBytes = 4;
 
     private readonly string _portName;
@@ -31,6 +33,7 @@ internal sealed class MeshtasticSerialSession
     private bool _hasLocalNode;
     private DateTime _nextAnnounceRetryUtc = DateTime.MaxValue;
     private DateTime _nextRefreshRetryUtc = DateTime.MaxValue;
+    private DateTime _lastMeshSendUtc = DateTime.MinValue;
     private byte[] _adminPasskey = [];
     private int? _pendingTxPowerDbm;
     private TaskCompletionSource<bool>? _txPowerWait;
@@ -128,6 +131,7 @@ internal sealed class MeshtasticSerialSession
         var framed = MeshtasticProto.Frame(
             MeshtasticProto.BuildToRadioPacket(to, NextPacketId(), payload.ToArray(), hopLimit: 3));
         WriteRaw(framed);
+        _lastMeshSendUtc = DateTime.UtcNow;
     }
 
     /// <summary>
@@ -358,8 +362,13 @@ internal sealed class MeshtasticSerialSession
     private void RetryDueWants()
     {
         var now = DateTime.UtcNow;
+        // After mesh TX, keep the serial pipe clear of want_config storms so chat frames
+        // are not delayed / interleaved with a full node-DB dump.
+        var quietAfterTx = now - _lastMeshSendUtc < WantConfigQuietAfterMeshTx;
+
         if (!_hasLocalNode && now >= _nextAnnounceRetryUtc)
         {
+            // Still need my_info to operate; announce is allowed even during quiet.
             try
             {
                 WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(1)));
@@ -376,6 +385,15 @@ internal sealed class MeshtasticSerialSession
 
         if (_refreshWait != null && now >= _nextRefreshRetryUtc)
         {
+            if (quietAfterTx)
+            {
+                _nextRefreshRetryUtc = now.AddSeconds(RefreshRetrySeconds);
+                Logger?.LogTrace(
+                    "Deferring want_config({Id}) retry — recent mesh TX on serial",
+                    _refreshWaitId);
+                return;
+            }
+
             try
             {
                 WriteRaw(MeshtasticProto.Frame(MeshtasticProto.BuildToRadioWantConfig(_refreshWaitId)));
