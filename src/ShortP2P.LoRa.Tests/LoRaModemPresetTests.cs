@@ -89,6 +89,29 @@ public class LoRaModemPresetTests
         Assert.Throws<ArgumentException>(() => MeshtasticProto.PatchLoRaConfigModemPreset([], 0));
     }
 
+    [Fact]
+    public void ParseLoRaConfig_Reads_Modem_Region_Power_And_Duty()
+    {
+        // Fields: use_preset=true, SHORT_TURBO, region EU_868 (=3), tx=14, override_duty_cycle=true.
+        byte[] blob =
+        [
+            0x08, 0x01, // use_preset
+            0x10, 0x08, // modem_preset SHORT_TURBO
+            0x38, 0x03, // region EU_868
+            0x50, 0x0E, // tx_power 14
+            0x60, 0x01 // override_duty_cycle
+        ];
+        var info = LoRaBoardConfigInfo.Parse(blob);
+        Assert.True(info.UsePreset);
+        Assert.Equal("SHORT_TURBO", info.ModemPresetName);
+        Assert.Equal("EU_868", info.RegionCode);
+        Assert.Equal(14, info.TxPowerDbm);
+        Assert.True(info.OverrideDutyCycle);
+        Assert.Equal(10.0, info.DutyCycleMaxPercent); // EU_868 catalog cap
+        Assert.Equal(10.0, info.EffectiveDutyCyclePercent);
+        Assert.False(info.IsEmpty);
+    }
+
     private static (Dictionary<int, uint> Values, Dictionary<int, int> Counts) ReadVarints(byte[] payload)
     {
         var values = new Dictionary<int, uint>();

@@ -33,12 +33,18 @@ public sealed record MeshatasticTransportOptions
     public bool ApplyTxPowerOnStart { get; init; }
 
     /// <summary>
-    ///     Modem preset written on start. Default LONG_FAST (factory).
+    ///     Modem preset written on start when <see cref="UseBoardPresets"/> is false. Default LONG_FAST.
     ///     Both peers must use the same preset or they will not hear each other.
     ///     Applied by GET of the full LoRaConfig, then use_preset=true and modem_preset;
     ///     region, channel, tx_power and every other field stay as the board reported them.
     /// </summary>
     public LoRaModemPresetInfo ModemPreset { get; init; } = LoRaModemPresets.Default;
+
+    /// <summary>
+    ///     When true, start does not write modem/region/power to the board; the host reads the
+    ///     board LoRaConfig and follows its region for the software duty-cycle budget.
+    /// </summary>
+    public bool UseBoardPresets { get; init; }
 
     public RetryConfig Retry { get; init; } = new();
 

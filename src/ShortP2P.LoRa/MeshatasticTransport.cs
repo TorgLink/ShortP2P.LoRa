@@ -71,6 +71,15 @@ public sealed class MeshatasticTransport : ITransport
 
     public MeshId? LocalMeshId { get; private set; }
 
+    /// <summary>Last LoRaConfig read from the board (empty until start / explicit read).</summary>
+    public LoRaBoardConfigInfo LastBoardConfig { get; private set; } = LoRaBoardConfigInfo.Parse([]);
+
+    /// <summary>
+    ///     Board LoRaConfig as read on start, before any app modem write.
+    ///     Used to auto-save a restore snapshot the first time we touch a COM port.
+    /// </summary>
+    public LoRaBoardConfigInfo InitialBoardConfig { get; private set; } = LoRaBoardConfigInfo.Parse([]);
+
     public byte Kind => TransportKind.Meshtastic;
 
     public ChannelReader<TransportReceiveMessage> Inbound => _channel.Reader;
@@ -107,9 +116,24 @@ public sealed class MeshatasticTransport : ITransport
             _logger?.LogInformation(
                 "Skipping board TX-power apply on start (ApplyTxPowerOnStart=false); board LoRa region/channel unchanged");
 
-        // Preset is separate from the TX-power opt-in. GET the full LoRaConfig and set
-        // use_preset + modem_preset only, so region/channel/tx_power are not replaced.
-        await ApplyConfiguredModemPresetAsync(cancellationToken).ConfigureAwait(false);
+        // Always read the board LoRaConfig first (region, modem, power, duty). Keep that snapshot
+        // so the host can auto-save it before our write wipes the original modem mode.
+        InitialBoardConfig = await ReadBoardLoRaConfigAsync(cancellationToken).ConfigureAwait(false);
+        LastBoardConfig = InitialBoardConfig;
+        if (_options.UseBoardPresets)
+        {
+            _logger?.LogInformation(
+                "UseBoardPresets=true — leaving board LoRaConfig unchanged (preset={Preset}, region={Region}, tx={Dbm}dBm, duty%={Duty}, overrideDuty={Override})",
+                LastBoardConfig.ModemPresetName, LastBoardConfig.RegionCode, LastBoardConfig.TxPowerDbm,
+                LastBoardConfig.DutyCycleMaxPercent, LastBoardConfig.OverrideDutyCycle);
+        }
+        else
+        {
+            // GET the full LoRaConfig and set use_preset + modem_preset only,
+            // so region/channel/tx_power are not replaced.
+            await ApplyConfiguredModemPresetAsync(cancellationToken).ConfigureAwait(false);
+            LastBoardConfig = await ReadBoardLoRaConfigAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _sweepTask = Task.Run(() => SweepLoopAsync(_cts.Token));
@@ -148,6 +172,47 @@ public sealed class MeshatasticTransport : ITransport
             "Applying Meshtastic modem preset {Name} (proto {Proto}). Both peers must use the same preset.",
             preset.Name, preset.ProtoValue);
         return radio.ApplyModemPresetAsync(preset.ProtoValue, cancellationToken);
+    }
+
+    /// <summary>GET the board LoRaConfig without writing.</summary>
+    public async ValueTask<LoRaBoardConfigInfo> ReadBoardLoRaConfigAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (!_started || _link is not IMeshRadioConfig radio)
+            return LoRaBoardConfigInfo.Parse([]);
+
+        var info = await radio.ReadLoRaConfigAsync(cancellationToken).ConfigureAwait(false);
+        LastBoardConfig = info;
+        return info;
+    }
+
+    /// <summary>Write a previously saved full LoRaConfig blob and refresh <see cref="LastBoardConfig"/>.</summary>
+    public async ValueTask<bool> RestoreBoardLoRaConfigAsync(ReadOnlyMemory<byte> loraConfig,
+        CancellationToken cancellationToken = default)
+    {
+        if (!_started || _link is not IMeshRadioConfig radio || loraConfig.Length == 0)
+            return false;
+
+        await radio.ApplyRawLoRaConfigAsync(loraConfig, cancellationToken).ConfigureAwait(false);
+        LastBoardConfig = await ReadBoardLoRaConfigAsync(cancellationToken).ConfigureAwait(false);
+        return !LastBoardConfig.IsEmpty;
+    }
+
+    /// <summary>Display name of this board from the radio node database, or the COM port.</summary>
+    public string BoardDisplayName
+    {
+        get
+        {
+            if (_link is IMeshNodeCatalog catalog && LocalMeshId != null
+                && LocalMeshId.TryToNodeNumber(out var self))
+            {
+                var node = catalog.Nodes.FirstOrDefault(n => n.NodeNumber == self);
+                if (node != null && !string.IsNullOrWhiteSpace(node.DisplayName))
+                    return node.DisplayName;
+            }
+
+            return _options.ComPort;
+        }
     }
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)

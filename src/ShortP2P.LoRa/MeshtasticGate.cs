@@ -256,6 +256,83 @@ public sealed class MeshtasticGate
         }
     }
 
+    /// <summary>GET the board LoRaConfig without writing (region, modem, power, duty fields).</summary>
+    internal async Task<LoRaBoardConfigInfo> ReadLoRaConfigAsync(object token, CancellationToken cancellationToken)
+    {
+        var done = new TaskCompletionSource<LoRaBoardConfigInfo>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commands.Add(() =>
+        {
+            try
+            {
+                var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+                if (session == null)
+                {
+                    done.TrySetResult(MeshtasticProto.ParseLoRaConfig([]));
+                    return;
+                }
+
+                session.BeginReadLoRaConfig(done);
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            return await done.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _session?.Logger?.LogWarning(
+                "LoRaConfig read timed out waiting for get_config_response; returning empty snapshot");
+            done.TrySetResult(MeshtasticProto.ParseLoRaConfig([]));
+            return MeshtasticProto.ParseLoRaConfig([]);
+        }
+    }
+
+    /// <summary>Write a previously saved full LoRaConfig blob (no field rebuild).</summary>
+    internal async Task ApplyRawLoRaConfigAsync(object token, ReadOnlyMemory<byte> loraConfig,
+        CancellationToken cancellationToken)
+    {
+        var bytes = loraConfig.ToArray();
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commands.Add(() =>
+        {
+            try
+            {
+                var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+                if (session == null)
+                {
+                    done.TrySetResult(false);
+                    return;
+                }
+
+                session.BeginApplyRawLoRaConfig(bytes, done);
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(8));
+        try
+        {
+            await done.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _session?.Logger?.LogWarning(
+                "Raw LoRaConfig restore timed out; board LoRaConfig left unchanged");
+            done.TrySetResult(false);
+        }
+    }
+
     /// <summary>
     ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
     ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.

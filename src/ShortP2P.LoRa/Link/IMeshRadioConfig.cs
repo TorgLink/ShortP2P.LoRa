@@ -11,4 +11,15 @@ public interface IMeshRadioConfig
     ///     <paramref name="modemPreset"/> is the protobuf enum value; only universal presets are written.
     /// </summary>
     ValueTask ApplyModemPresetAsync(int modemPreset, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    ///     GET the board's current full LoRaConfig without writing. Empty when the board did not answer.
+    /// </summary>
+    ValueTask<LoRaBoardConfigInfo> ReadLoRaConfigAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    ///     Write a previously saved full LoRaConfig blob via set_config (no field rebuild).
+    ///     Empty blobs are rejected so the section cannot be wiped.
+    /// </summary>
+    ValueTask ApplyRawLoRaConfigAsync(ReadOnlyMemory<byte> loraConfig, CancellationToken cancellationToken = default);
 }

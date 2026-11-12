@@ -98,6 +98,20 @@ public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog, IMeshRadio
         return new ValueTask(_gate.ApplyModemPresetAsync(_token, modemPreset, cancellationToken));
     }
 
+    /// <inheritdoc />
+    public ValueTask<LoRaBoardConfigInfo> ReadLoRaConfigAsync(CancellationToken cancellationToken = default)
+    {
+        return new ValueTask<LoRaBoardConfigInfo>(
+            _gate.ReadLoRaConfigAsync(_token, cancellationToken));
+    }
+
+    /// <inheritdoc />
+    public ValueTask ApplyRawLoRaConfigAsync(ReadOnlyMemory<byte> loraConfig,
+        CancellationToken cancellationToken = default)
+    {
+        return new ValueTask(_gate.ApplyRawLoRaConfigAsync(_token, loraConfig, cancellationToken));
+    }
+
     public async ValueTask DisposeAsync()
     {
         _gate.FrameReceived -= OnGateFrame;

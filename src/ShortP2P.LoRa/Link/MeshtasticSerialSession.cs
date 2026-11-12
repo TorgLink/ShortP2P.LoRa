@@ -36,6 +36,10 @@ internal sealed class MeshtasticSerialSession
     private TaskCompletionSource<bool>? _txPowerWait;
     private int? _pendingModemPreset;
     private TaskCompletionSource<bool>? _modemPresetWait;
+    private bool _pendingReadOnly;
+    private TaskCompletionSource<LoRaBoardConfigInfo>? _readConfigWait;
+    private byte[]? _pendingRawLoraConfig;
+    private TaskCompletionSource<bool>? _rawConfigWait;
 
     /// <summary>Raw board frames (raised on the radio thread).</summary>
     internal event Action<MeshLinkFrame>? Received;
@@ -203,6 +207,75 @@ internal sealed class MeshtasticSerialSession
             done.TrySetResult(false);
             _modemPresetWait = null;
             _pendingModemPreset = null;
+        }
+    }
+
+    /// <summary>GET the board LoRaConfig and complete with the parsed snapshot (no set_config).</summary>
+    internal void BeginReadLoRaConfig(TaskCompletionSource<LoRaBoardConfigInfo> done)
+    {
+        EnsureOwner();
+        if (_port is not { IsOpen: true } || !_hasLocalNode)
+        {
+            done.TrySetResult(MeshtasticProto.ParseLoRaConfig([]));
+            return;
+        }
+
+        _readConfigWait?.TrySetResult(MeshtasticProto.ParseLoRaConfig([]));
+        _readConfigWait = done;
+        _pendingReadOnly = true;
+
+        try
+        {
+            var admin = MeshtasticProto.BuildAdminGetLoraConfig();
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            Logger?.LogDebug("Requested full LoRa config from board (read-only)");
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to request LoRa config for read-only snapshot");
+            done.TrySetResult(MeshtasticProto.ParseLoRaConfig([]));
+            _readConfigWait = null;
+            _pendingReadOnly = false;
+        }
+    }
+
+    /// <summary>
+    ///     Write a previously saved full LoRaConfig blob. Still GETs first when a passkey is needed
+    ///     on modern firmware; the set_config body is the saved blob, not a rebuilt merge.
+    /// </summary>
+    internal void BeginApplyRawLoRaConfig(byte[] loraConfig, TaskCompletionSource<bool> done)
+    {
+        EnsureOwner();
+        if (loraConfig.Length == 0 || _port is not { IsOpen: true } || !_hasLocalNode)
+        {
+            done.TrySetResult(false);
+            return;
+        }
+
+        _rawConfigWait?.TrySetResult(false);
+        _rawConfigWait = done;
+        _pendingRawLoraConfig = loraConfig;
+
+        try
+        {
+            // Prefer a fresh passkey: GET then replace the response body with our saved blob.
+            var admin = MeshtasticProto.BuildAdminGetLoraConfig();
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            Logger?.LogDebug(
+                "Requested LoRa config before restoring saved blob ({Len} bytes)", loraConfig.Length);
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to request LoRa config before raw restore");
+            done.TrySetResult(false);
+            _rawConfigWait = null;
+            _pendingRawLoraConfig = null;
         }
     }
 
@@ -435,7 +508,42 @@ internal sealed class MeshtasticSerialSession
                     // Only write after we have the board's current LoRaConfig (get_config_response).
                     // TX power and modem preset share that blob so the second set_config cannot
                     // put back a stale copy of the field the other apply just changed.
-                    if (_pendingTxPowerDbm != null || _pendingModemPreset != null)
+                    if (_pendingReadOnly)
+                    {
+                        if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var readLora))
+                        {
+                            var info = MeshtasticProto.ParseLoRaConfig(readLora);
+                            _pendingReadOnly = false;
+                            _readConfigWait?.TrySetResult(info);
+                            _readConfigWait = null;
+                            Logger?.LogInformation(
+                                "Read board LoRaConfig: preset={Preset} region={Region} tx={Dbm}dBm overrideDuty={Override} duty%={Duty}",
+                                info.ModemPresetName, info.RegionCode, info.TxPowerDbm,
+                                info.OverrideDutyCycle, info.DutyCycleMaxPercent);
+                        }
+                        else
+                        {
+                            Logger?.LogDebug(
+                                "Admin payload while LoRa read is pending did not contain get_config_response.lora ({Bytes} bytes)",
+                                admin.Length);
+                        }
+                    }
+                    else if (_pendingRawLoraConfig != null)
+                    {
+                        // Passkey may arrive on this admin payload; then write the saved blob as-is.
+                        if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out _)
+                            || _adminPasskey.Length > 0)
+                        {
+                            WriteRawLoraConfig(_pendingRawLoraConfig);
+                        }
+                        else
+                        {
+                            Logger?.LogDebug(
+                                "Admin payload while raw LoRa restore is pending — waiting for passkey/config ({Bytes} bytes)",
+                                admin.Length);
+                        }
+                    }
+                    else if (_pendingTxPowerDbm != null || _pendingModemPreset != null)
                     {
                         if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var lora))
                         {
@@ -506,6 +614,34 @@ internal sealed class MeshtasticSerialSession
             _txPowerWait = null;
             _modemPresetWait?.TrySetResult(false);
             _modemPresetWait = null;
+        }
+    }
+
+    private void WriteRawLoraConfig(byte[] loraConfig)
+    {
+        try
+        {
+            var admin = MeshtasticProto.BuildAdminSetLoraConfig(loraConfig, _adminPasskey);
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            var info = MeshtasticProto.ParseLoRaConfig(loraConfig);
+            Logger?.LogInformation(
+                "Restored full Meshtastic LoRaConfig blob ({Len} bytes): preset={Preset} region={Region} tx={Dbm}dBm duty%={Duty} overrideDuty={Override}",
+                loraConfig.Length, info.ModemPresetName, info.RegionCode, info.TxPowerDbm,
+                info.DutyCycleMaxPercent, info.OverrideDutyCycle);
+            _pendingRawLoraConfig = null;
+            _rawConfigWait?.TrySetResult(true);
+            _rawConfigWait = null;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to restore raw Meshtastic LoRaConfig ({Len} bytes)",
+                loraConfig.Length);
+            _pendingRawLoraConfig = null;
+            _rawConfigWait?.TrySetResult(false);
+            _rawConfigWait = null;
         }
     }
 

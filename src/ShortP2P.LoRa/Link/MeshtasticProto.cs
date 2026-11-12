@@ -132,6 +132,59 @@ internal static class MeshtasticProto
     }
 
     /// <summary>
+    ///     Read use_preset (1), modem_preset (2), region (7), tx_power (10) and
+    ///     override_duty_cycle (12) from a LoRaConfig blob.
+    ///     Missing fields keep defaults: use_preset false, modem LONG_FAST (0), region UNSET (0),
+    ///     tx_power 0, override_duty_cycle false. Duty-cycle percent comes from the region catalog.
+    /// </summary>
+    public static LoRaBoardConfigInfo ParseLoRaConfig(ReadOnlySpan<byte> loraConfig)
+    {
+        var usePreset = false;
+        var modem = 0;
+        var region = 0;
+        var txPower = 0;
+        var overrideDuty = false;
+        if (loraConfig.Length > 0)
+        {
+            ReadFields(loraConfig, (number, wireType, varint, _) =>
+            {
+                if (wireType != 0)
+                    return;
+                switch (number)
+                {
+                    case 1:
+                        usePreset = varint != 0;
+                        break;
+                    case 2:
+                        modem = unchecked((int)varint);
+                        break;
+                    case 7:
+                        region = unchecked((int)varint);
+                        break;
+                    case 10:
+                        txPower = unchecked((int)varint);
+                        break;
+                    case 12:
+                        overrideDuty = varint != 0;
+                        break;
+                }
+            });
+        }
+
+        var regionCode = MeshtasticRegionCodes.CodeForProto(region);
+        return new LoRaBoardConfigInfo(
+            loraConfig.Length == 0 ? [] : loraConfig.ToArray(),
+            region,
+            regionCode,
+            modem,
+            MeshtasticRegionCodes.ModemPresetName(modem),
+            txPower,
+            usePreset,
+            overrideDuty,
+            LoRaBoardConfigInfo.DutyCyclePercentForRegion(regionCode));
+    }
+
+    /// <summary>
     ///     Copy an existing LoRaConfig and set use_preset (field 1) plus modem_preset (field 2).
     ///     Every other field (region, channel, tx_power, bandwidth, …) is kept.
     ///     <paramref name="modemPreset"/> must be one of the universal preset numbers
