@@ -34,6 +34,8 @@ internal sealed class MeshtasticSerialSession
     private byte[] _adminPasskey = [];
     private int? _pendingTxPowerDbm;
     private TaskCompletionSource<bool>? _txPowerWait;
+    private int? _pendingModemPreset;
+    private TaskCompletionSource<bool>? _modemPresetWait;
 
     /// <summary>Raw board frames (raised on the radio thread).</summary>
     internal event Action<MeshLinkFrame>? Received;
@@ -159,6 +161,48 @@ internal sealed class MeshtasticSerialSession
             done.TrySetResult(false);
             _txPowerWait = null;
             _pendingTxPowerDbm = null;
+        }
+    }
+
+    /// <summary>
+    ///     Set Config.LoRaConfig.use_preset and modem_preset on the local board.
+    ///     GET the current LoRaConfig and merge those fields into that full blob —
+    ///     a set_config that contains only the preset replaces the whole LoRa section
+    ///     and wipes region, channel and tx_power. If a TX-power apply is already
+    ///     waiting on the same GET, the response writes both in one merged blob.
+    /// </summary>
+    internal void BeginApplyModemPreset(int modemPreset, TaskCompletionSource<bool> done)
+    {
+        EnsureOwner();
+        if (!global::ShortP2P.LoRa.LoRaModemPresets.IsAllowedProtoValue(modemPreset)
+            || _port is not { IsOpen: true }
+            || !_hasLocalNode)
+        {
+            done.TrySetResult(false);
+            return;
+        }
+
+        _modemPresetWait?.TrySetResult(false);
+        _modemPresetWait = done;
+        _pendingModemPreset = modemPreset;
+
+        try
+        {
+            var admin = MeshtasticProto.BuildAdminGetLoraConfig();
+            var framed = MeshtasticProto.Frame(
+                MeshtasticProto.BuildToRadioPacket(
+                    _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
+            WriteRaw(framed);
+            Logger?.LogDebug(
+                "Requested full LoRa config from board before applying modem preset {Preset}",
+                global::ShortP2P.LoRa.LoRaModemPresets.NameForProtoValue(modemPreset));
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Failed to request LoRa config for modem preset apply");
+            done.TrySetResult(false);
+            _modemPresetWait = null;
+            _pendingModemPreset = null;
         }
     }
 
@@ -389,17 +433,25 @@ internal sealed class MeshtasticSerialSession
                     }
 
                     // Only write after we have the board's current LoRaConfig (get_config_response).
-                    if (_pendingTxPowerDbm is int dbm)
+                    // TX power and modem preset share that blob so the second set_config cannot
+                    // put back a stale copy of the field the other apply just changed.
+                    if (_pendingTxPowerDbm != null || _pendingModemPreset != null)
                     {
                         if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var lora))
                         {
-                            var patched = MeshtasticProto.PatchLoRaConfigTxPower(lora, dbm);
-                            WriteFullLoraConfig(patched, completeWait: true);
+                            var dbm = _pendingTxPowerDbm;
+                            var preset = _pendingModemPreset;
+                            var patched = lora;
+                            if (dbm is int power)
+                                patched = MeshtasticProto.PatchLoRaConfigTxPower(patched, power);
+                            if (preset is int mode)
+                                patched = MeshtasticProto.PatchLoRaConfigModemPreset(patched, mode);
+                            WriteMergedLoraConfig(patched, dbm, preset);
                         }
                         else
                         {
                             Logger?.LogDebug(
-                                "Admin payload while TX-power pending did not contain get_config_response.lora ({Bytes} bytes)",
+                                "Admin payload while LoRa config apply is pending did not contain get_config_response.lora ({Bytes} bytes)",
                                 admin.Length);
                         }
                     }
@@ -419,9 +471,8 @@ internal sealed class MeshtasticSerialSession
         }
     }
 
-    private void WriteFullLoraConfig(byte[] loraConfig, bool completeWait)
+    private void WriteMergedLoraConfig(byte[] loraConfig, int? txPowerDbm, int? modemPreset)
     {
-        var dbm = _pendingTxPowerDbm;
         try
         {
             var admin = MeshtasticProto.BuildAdminSetLoraConfig(loraConfig, _adminPasskey);
@@ -429,21 +480,32 @@ internal sealed class MeshtasticSerialSession
                 MeshtasticProto.BuildToRadioPacket(
                     _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
             WriteRaw(framed);
-            Logger?.LogInformation(
-                "Meshtastic TX power set to {Dbm} dBm via full LoRaConfig merge (passkey={HasKey}, loraBytes={Len})",
-                dbm, _adminPasskey.Length > 0, loraConfig.Length);
-            if (!completeWait)
-                return;
+            if (txPowerDbm is int dbm)
+                Logger?.LogInformation(
+                    "Meshtastic TX power set to {Dbm} dBm via full LoRaConfig merge (passkey={HasKey}, loraBytes={Len})",
+                    dbm, _adminPasskey.Length > 0, loraConfig.Length);
+            if (modemPreset is int preset)
+                Logger?.LogInformation(
+                    "Meshtastic modem preset {Preset} applied via full LoRaConfig merge (use_preset=true, passkey={HasKey}, loraBytes={Len})",
+                    global::ShortP2P.LoRa.LoRaModemPresets.NameForProtoValue(preset) ?? preset.ToString(),
+                    _adminPasskey.Length > 0, loraConfig.Length);
             _pendingTxPowerDbm = null;
+            _pendingModemPreset = null;
             _txPowerWait?.TrySetResult(true);
             _txPowerWait = null;
+            _modemPresetWait?.TrySetResult(true);
+            _modemPresetWait = null;
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Failed to set Meshtastic TX power to {Dbm} dBm", dbm);
+            Logger?.LogWarning(ex, "Failed to write merged Meshtastic LoRaConfig (txPower={Dbm}, preset={Preset})",
+                txPowerDbm, modemPreset);
             _pendingTxPowerDbm = null;
+            _pendingModemPreset = null;
             _txPowerWait?.TrySetResult(false);
             _txPowerWait = null;
+            _modemPresetWait?.TrySetResult(false);
+            _modemPresetWait = null;
         }
     }
 

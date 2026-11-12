@@ -8,6 +8,9 @@ namespace ShortP2P.LoRa.Link;
 ///     MeshPacket: from=1(fixed32), to=2(fixed32), channel=3, decoded=4(Data), id=6(fixed32), hop_limit=9.
 ///     Data: portnum=1(varint), payload=2(bytes). PortNum PRIVATE_APP = 256.
 ///     MyNodeInfo: my_node_num=1(varint). FromRadio: packet=2, my_info=3. ToRadio: packet=1, want_config_id=3.
+///     LoRaConfig: use_preset=1, modem_preset=2, region=7, tx_power=10.
+///     ModemPreset numbers follow config.proto (no generated enum in this repo):
+///     LONG_FAST=0, MEDIUM_SLOW=3, MEDIUM_FAST=4, SHORT_SLOW=5, SHORT_FAST=6, LONG_MODERATE=7.
 ///     Serial framing: 0x94 0xC3 + uint16 BE length + protobuf payload.
 /// </summary>
 internal static class MeshtasticProto
@@ -125,6 +128,43 @@ internal static class MeshtasticProto
 
         WriteVarint(ms, (10 << 3) | 0); // tx_power
         WriteVarint(ms, unchecked((uint)txPowerDbm));
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    ///     Copy an existing LoRaConfig and set use_preset (field 1) plus modem_preset (field 2).
+    ///     Every other field (region, channel, tx_power, bandwidth, …) is kept.
+    ///     <paramref name="modemPreset"/> must be one of the universal preset numbers
+    ///     (<see cref="LoRaModemPresets"/>). An empty blob is rejected so a preset-only
+    ///     set_config cannot wipe the section.
+    /// </summary>
+    public static byte[] PatchLoRaConfigModemPreset(ReadOnlySpan<byte> loraConfig, int modemPreset)
+    {
+        if (loraConfig.Length == 0)
+            throw new ArgumentException("LoRaConfig bytes are required.", nameof(loraConfig));
+        if (!global::ShortP2P.LoRa.LoRaModemPresets.IsAllowedProtoValue(modemPreset))
+            throw new ArgumentOutOfRangeException(nameof(modemPreset), modemPreset,
+                "Modem preset is not in the universal set (every region, current firmware).");
+
+        using var ms = new MemoryStream(loraConfig.Length + 8);
+        var o = 0;
+        while (o < loraConfig.Length)
+        {
+            var fieldStart = o;
+            if (!TryReadVarint(loraConfig, ref o, out var tag))
+                break;
+            var number = (int)(tag >> 3);
+            var wire = (int)(tag & 7);
+            if (!TrySkipFieldValue(loraConfig, ref o, wire))
+                break;
+            if (number is not (1 or 2))
+                ms.Write(loraConfig[fieldStart..o]);
+        }
+
+        WriteVarint(ms, (1 << 3) | 0); // use_preset
+        WriteVarint(ms, 1);
+        WriteVarint(ms, (2 << 3) | 0); // modem_preset
+        WriteVarint(ms, unchecked((uint)modemPreset));
         return ms.ToArray();
     }
 

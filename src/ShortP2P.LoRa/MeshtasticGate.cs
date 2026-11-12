@@ -216,6 +216,47 @@ public sealed class MeshtasticGate
     }
 
     /// <summary>
+    ///     Apply a universal modem preset on the open session (use_preset=true, modem_preset).
+    ///     Merged into the board's full LoRaConfig so region, channel and tx_power stay.
+    /// </summary>
+    internal async Task ApplyModemPresetAsync(object token, int modemPreset, CancellationToken cancellationToken)
+    {
+        var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commands.Add(() =>
+        {
+            try
+            {
+                var session = ReferenceEquals(_sessionToken, token) ? _session : null;
+                if (session == null)
+                {
+                    done.TrySetResult(false);
+                    return;
+                }
+
+                session.BeginApplyModemPreset(modemPreset, done);
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await done.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Never write a partial LoRaConfig on timeout — that wiped region/channel before.
+            _session?.Logger?.LogWarning(
+                "Modem preset apply timed out waiting for get_config_response; board LoRaConfig left unchanged");
+            done.TrySetResult(false);
+        }
+    }
+
+    /// <summary>
     ///     How long TX would wait before a payload of this size fits the duty-cycle budget.
     ///     Used by the host to skip presence keepalives when chat/handshake needs the airtime.
     ///     Adds one radio-overhead estimate (single frame).

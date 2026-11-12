@@ -107,6 +107,10 @@ public sealed class MeshatasticTransport : ITransport
             _logger?.LogInformation(
                 "Skipping board TX-power apply on start (ApplyTxPowerOnStart=false); board LoRa region/channel unchanged");
 
+        // Preset is separate from the TX-power opt-in. GET the full LoRaConfig and set
+        // use_preset + modem_preset only, so region/channel/tx_power are not replaced.
+        await ApplyConfiguredModemPresetAsync(cancellationToken).ConfigureAwait(false);
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _sweepTask = Task.Run(() => SweepLoopAsync(_cts.Token));
 
@@ -128,6 +132,22 @@ public sealed class MeshatasticTransport : ITransport
             _logger?.LogInformation("Applying Meshtastic TX power {Dbm} dBm", effective);
 
         return radio.ApplyTxPowerDbmAsync(effective, cancellationToken);
+    }
+
+    /// <summary>
+    ///     Write <see cref="MeshatasticTransportOptions.ModemPreset"/> (use_preset=true).
+    ///     Both peers must use the same preset. No-op when the link cannot configure the radio.
+    /// </summary>
+    public ValueTask ApplyConfiguredModemPresetAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_started || _link is not IMeshRadioConfig radio)
+            return ValueTask.CompletedTask;
+
+        var preset = _options.ModemPreset ?? LoRaModemPresets.Default;
+        _logger?.LogInformation(
+            "Applying Meshtastic modem preset {Name} (proto {Proto}). Both peers must use the same preset.",
+            preset.Name, preset.ProtoValue);
+        return radio.ApplyModemPresetAsync(preset.ProtoValue, cancellationToken);
     }
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)

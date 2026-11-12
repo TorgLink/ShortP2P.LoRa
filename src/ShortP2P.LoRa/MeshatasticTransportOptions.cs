@@ -32,6 +32,14 @@ public sealed record MeshatasticTransportOptions
     /// </summary>
     public bool ApplyTxPowerOnStart { get; init; }
 
+    /// <summary>
+    ///     Modem preset written on start. Default LONG_FAST (factory).
+    ///     Both peers must use the same preset or they will not hear each other.
+    ///     Applied by GET of the full LoRaConfig, then use_preset=true and modem_preset;
+    ///     region, channel, tx_power and every other field stay as the board reported them.
+    /// </summary>
+    public LoRaModemPresetInfo ModemPreset { get; init; } = LoRaModemPresets.Default;
+
     public RetryConfig Retry { get; init; } = new();
 
     /// <summary>Local ShortP2P NetworkId, 12-byte wire form. Set before start.</summary>
