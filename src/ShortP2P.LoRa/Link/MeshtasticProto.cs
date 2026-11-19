@@ -7,7 +7,8 @@ namespace ShortP2P.LoRa.Link;
 ///     Field numbers follow meshtastic/protobufs (mesh.proto):
 ///     MeshPacket: from=1(fixed32), to=2(fixed32), channel=3, decoded=4(Data), id=6(fixed32), hop_limit=9.
 ///     Data: portnum=1(varint), payload=2(bytes). PortNum PRIVATE_APP = 256.
-///     MyNodeInfo: my_node_num=1(varint). FromRadio: packet=2, my_info=3. ToRadio: packet=1, want_config_id=3.
+///     MyNodeInfo: my_node_num=1(varint). FromRadio: packet=2, my_info=3, node_info=4. ToRadio: packet=1, want_config_id=3.
+///     NodeInfo: num=1(varint), user=2, last_heard=5(fixed32). Config.LoRaConfig: region=7(varint), tx_power=10(varint).
 ///     Serial framing: 0x94 0xC3 + uint16 BE length + protobuf payload.
 /// </summary>
 internal static class MeshtasticProto
@@ -21,6 +22,52 @@ internal static class MeshtasticProto
 
     /// <summary>AdminMessage.ConfigType.LORA_CONFIG</summary>
     public const uint AdminConfigTypeLora = 5;
+
+    /// <summary>NodeInfo.last_heard (mesh.proto field 5, fixed32). Zero means the board reported no hear time.</summary>
+    public const int NodeInfoLastHeardField = 5;
+
+    /// <summary>Config.LoRaConfig.region (config.proto field 7, varint RegionCode).</summary>
+    public const int LoRaConfigRegionField = 7;
+
+    /// <summary>Config.LoRaConfig.tx_power (config.proto field 10, varint).</summary>
+    public const int LoRaConfigTxPowerField = 10;
+
+    /// <summary>
+    ///     Config.LoRaConfig.RegionCode discriminants from meshtastic config.proto.
+    ///     These are enum values, not protobuf field numbers. The field written on the wire is
+    ///     <see cref="LoRaConfigRegionField"/>.
+    /// </summary>
+    internal static class RegionCode
+    {
+        public const uint Unset = 0;
+        public const uint Us = 1;
+        public const uint Eu433 = 2;
+        public const uint Eu868 = 3;
+        public const uint Cn = 4;
+        public const uint Jp = 5;
+        public const uint Anz = 6;
+        public const uint Kr = 7;
+        public const uint Tw = 8;
+        public const uint Ru = 9;
+        public const uint In = 10;
+        public const uint Nz865 = 11;
+        public const uint Th = 12;
+        public const uint Lora24 = 13;
+        public const uint Ua433 = 14;
+        public const uint My433 = 16;
+        public const uint My919 = 17;
+        public const uint Sg923 = 18;
+        public const uint Ph433 = 19;
+        public const uint Ph868 = 20;
+        public const uint Ph915 = 21;
+        public const uint Anz433 = 22;
+        public const uint Kz433 = 23;
+        public const uint Kz863 = 24;
+        public const uint Np865 = 25;
+        public const uint Br902 = 26;
+        public const uint Eu866 = 29;
+        public const uint EuN868 = 32;
+    }
 
     public static byte[] BuildToRadioWantConfig(uint configId)
     {
@@ -103,10 +150,27 @@ internal static class MeshtasticProto
     }
 
     /// <summary>
-    ///     Copy an existing LoRaConfig protobuf and replace/add tx_power (field 10).
-    ///     Other fields (region, modem, channel_num, …) stay intact.
+    ///     Copy an existing LoRaConfig protobuf and replace/add tx_power
+    ///     (<see cref="LoRaConfigTxPowerField"/>). Other fields (region, modem, channel_num, …) stay intact.
     /// </summary>
-    public static byte[] PatchLoRaConfigTxPower(ReadOnlySpan<byte> loraConfig, int txPowerDbm)
+    public static byte[] PatchLoRaConfigTxPower(ReadOnlySpan<byte> loraConfig, int txPowerDbm) =>
+        PatchLoRaConfigVarint(loraConfig, LoRaConfigTxPowerField, unchecked((uint)txPowerDbm));
+
+    /// <summary>
+    ///     Copy an existing LoRaConfig protobuf and replace/add region
+    ///     (<see cref="LoRaConfigRegionField"/>). Modem preset, channel slot, tx power, and every
+    ///     other field stay intact. Never builds a partial config. <see cref="RegionCode.Unset"/> is rejected:
+    ///     callers must skip the write when the jurisdiction is UNSET.
+    /// </summary>
+    public static byte[] PatchLoRaConfigRegion(ReadOnlySpan<byte> loraConfig, uint regionCode)
+    {
+        if (regionCode == RegionCode.Unset)
+            throw new ArgumentOutOfRangeException(nameof(regionCode), "UNSET region is not written to the board.");
+        return PatchLoRaConfigVarint(loraConfig, LoRaConfigRegionField, regionCode);
+    }
+
+    /// <summary>Replace one varint field and keep every other field's raw bytes.</summary>
+    private static byte[] PatchLoRaConfigVarint(ReadOnlySpan<byte> loraConfig, int fieldNumber, uint value)
     {
         using var ms = new MemoryStream(loraConfig.Length + 8);
         var o = 0;
@@ -119,12 +183,12 @@ internal static class MeshtasticProto
             var wire = (int)(tag & 7);
             if (!TrySkipFieldValue(loraConfig, ref o, wire))
                 break;
-            if (number != 10)
+            if (number != fieldNumber)
                 ms.Write(loraConfig[fieldStart..o]);
         }
 
-        WriteVarint(ms, (10 << 3) | 0); // tx_power
-        WriteVarint(ms, unchecked((uint)txPowerDbm));
+        WriteVarint(ms, (uint)((fieldNumber << 3) | 0));
+        WriteVarint(ms, value);
         return ms.ToArray();
     }
 
@@ -301,7 +365,10 @@ internal static class MeshtasticProto
         });
     }
 
-    /// <summary>NodeInfo: num=1, user=2 (User.id=1, long_name=2, short_name=3).</summary>
+    /// <summary>
+    ///     NodeInfo: num=1, user=2 (User.id=1, long_name=2, short_name=3),
+    ///     last_heard=<see cref="NodeInfoLastHeardField"/> (fixed32).
+    /// </summary>
     private static void TryReadNodeInfo(ReadOnlySpan<byte> payload, Action<MeshtasticRadioNode>? onNode)
     {
         if (onNode == null)
@@ -311,6 +378,7 @@ internal static class MeshtasticProto
         var longName = "";
         var shortName = "";
         var userId = "";
+        uint lastHeard = 0;
         ReadFields(payload, (number, wireType, varint, bytes) =>
         {
             switch (number, wireType)
@@ -338,12 +406,15 @@ internal static class MeshtasticProto
                         }
                     });
                     break;
+                case (NodeInfoLastHeardField, 5) when bytes.Length >= 4:
+                    lastHeard = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+                    break;
             }
         });
 
         if (num == 0 || num == 0xFFFFFFFF)
             return;
-        onNode(new MeshtasticRadioNode(num, longName, shortName, userId));
+        onNode(new MeshtasticRadioNode(num, longName, shortName, userId, lastHeard));
     }
 
     /// <summary>Walk top-level protobuf fields. Unknown / malformed fields end the walk.</summary>

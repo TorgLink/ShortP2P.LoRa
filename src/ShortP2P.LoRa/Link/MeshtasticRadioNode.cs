@@ -1,7 +1,16 @@
 namespace ShortP2P.LoRa.Link;
 
 /// <summary>One node from the Meshtastic board node database (FromRadio.node_info).</summary>
-public sealed record MeshtasticRadioNode(uint NodeNumber, string LongName, string ShortName, string UserId)
+/// <param name="LastHeardUnix">
+///     NodeInfo.last_heard (Unix seconds, fixed32). Zero when the board omitted it.
+///     A replay of the node database is not a new hear — compare this timestamp.
+/// </param>
+public sealed record MeshtasticRadioNode(
+    uint NodeNumber,
+    string LongName,
+    string ShortName,
+    string UserId,
+    uint LastHeardUnix = 0)
 {
     /// <summary>Meshtastic user id ("!aabbccdd") or the node number in that form.</summary>
     public string NodeId =>

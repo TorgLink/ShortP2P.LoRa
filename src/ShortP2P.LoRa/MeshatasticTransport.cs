@@ -130,6 +130,31 @@ public sealed class MeshatasticTransport : ITransport
         return radio.ApplyTxPowerDbmAsync(effective, cancellationToken);
     }
 
+    /// <summary>
+    ///     Write <paramref name="jurisdiction"/> onto the board without clearing channel, modem preset, or PSK.
+    ///     UNSET and codes with no Meshtastic region discriminant are left unwritten.
+    /// </summary>
+    public ValueTask ApplyJurisdictionAsync(JurisdictionProfile jurisdiction, CancellationToken cancellationToken = default)
+    {
+        if (!_started || jurisdiction.IsUnset)
+            return ValueTask.CompletedTask;
+        if (!MeshtasticRegionMap.TryGetCode(jurisdiction.Code, out var code))
+        {
+            _logger?.LogInformation(
+                "Jurisdiction {Code} has no Meshtastic region code; board LoRa region left unchanged",
+                jurisdiction.Code);
+            return ValueTask.CompletedTask;
+        }
+
+        if (_link is not IMeshRadioConfig radio)
+            return ValueTask.CompletedTask;
+
+        _logger?.LogInformation(
+            "Applying Meshtastic region {Code} (enum {RegionCode}) via full LoRaConfig merge",
+            jurisdiction.Code, code);
+        return radio.ApplyRegionCodeAsync(code, cancellationToken);
+    }
+
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)
     {
         _started = false;

@@ -178,7 +178,33 @@ public sealed class MeshtasticGate
     }
 
     /// <summary>Apply Config.LoRaConfig.tx_power on the open session (REQ-RF-8).</summary>
-    internal async Task ApplyTxPowerAsync(object token, int txPowerDbm, CancellationToken cancellationToken)
+    internal Task ApplyTxPowerAsync(object token, int txPowerDbm, CancellationToken cancellationToken) =>
+        ApplyLoraConfigAsync(
+            token,
+            "TX power",
+            (session, done) => session.BeginApplyTxPower(txPowerDbm, done),
+            cancellationToken);
+
+    /// <summary>
+    ///     Apply Config.LoRaConfig.region on the open session: GET the full blob, patch region, SET the full blob.
+    ///     A zero (UNSET) code is not written.
+    /// </summary>
+    internal Task ApplyRegionCodeAsync(object token, uint regionCode, CancellationToken cancellationToken)
+    {
+        if (regionCode == 0)
+            return Task.CompletedTask;
+        return ApplyLoraConfigAsync(
+            token,
+            "region",
+            (session, done) => session.BeginApplyRegion(regionCode, done),
+            cancellationToken);
+    }
+
+    private async Task ApplyLoraConfigAsync(
+        object token,
+        string purpose,
+        Action<MeshtasticSerialSession, TaskCompletionSource<bool>> begin,
+        CancellationToken cancellationToken)
     {
         var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _commands.Add(() =>
@@ -192,7 +218,7 @@ public sealed class MeshtasticGate
                     return;
                 }
 
-                session.BeginApplyTxPower(txPowerDbm, done);
+                begin(session, done);
             }
             catch (Exception ex)
             {
@@ -210,7 +236,8 @@ public sealed class MeshtasticGate
         {
             // Never write a partial LoRaConfig on timeout — that wiped region/channel before.
             _session?.Logger?.LogWarning(
-                "TX power apply timed out waiting for get_config_response; board LoRaConfig left unchanged");
+                "{Purpose} apply timed out waiting for get_config_response; board LoRaConfig left unchanged",
+                purpose);
             done.TrySetResult(false);
         }
     }
@@ -248,8 +275,9 @@ public sealed class MeshtasticGate
     ///     frame is parked in <see cref="_deferred" /> and fires from the loop when the window slides.
     ///     The radio thread never blocks waiting for airtime.
     ///     Deferred frames are ordered by <see cref="MeshtasticTxClassifier" /> (REQ-TX-PRIO-1):
-    ///     control/presence/discovery before text/binary. Presence that cannot fit the current
-    ///     duty budget is still dropped (keepalive) rather than queued forever.
+    ///     control before text/binary. Presence that cannot go now is parked
+    ///     (<see cref="MeshtasticPresenceQueue"/>), not completed as a drop, and does not cut in
+    ///     front of non-presence work already in <see cref="_deferred"/>.
     /// </summary>
     private void TryDeliver(object token, uint to, byte[] payload, TaskCompletionSource<bool> done,
         bool paceExempt = false)
@@ -264,28 +292,22 @@ public sealed class MeshtasticGate
             }
 
             var isPresence = IsPresencePayload(payload);
-            // Presence is keepalive: never cut in front of deferred chat/chunk/control work.
-            if (isPresence && _deferred.Exists(d => !IsPresencePayload(d.Payload)))
-            {
-                session.Logger?.LogInformation(
-                    "Skipping presence TX — non-presence radio work is already deferred");
-                done.TrySetResult(true);
-                return;
-            }
-
             var wait = _duty.WaitTimeFor(payload.Length + RadioOverheadBytes, DateTime.UtcNow,
                 enforcePace: !paceExempt);
-            if (wait > TimeSpan.Zero)
+            if (isPresence)
             {
-                if (isPresence)
+                var nonPresenceWaiting = _deferred.Exists(d => !IsPresencePayload(d.Payload));
+                if (wait > TimeSpan.Zero || nonPresenceWaiting)
                 {
                     session.Logger?.LogInformation(
-                        "Skipping presence TX — duty cycle budget spent ({Spent:F1}/{Budget:F1} s)",
-                        _duty.SpentSeconds, _duty.BudgetSeconds);
-                    done.TrySetResult(true);
+                        "Deferring presence TX to {To:X8} — duty {Spent:F1}/{Budget:F1} s, wait {Seconds:F1} s, non-presence queued {Queued}",
+                        to, _duty.SpentSeconds, _duty.BudgetSeconds, wait.TotalSeconds, nonPresenceWaiting);
+                    DeferPresence(token, to, payload, done, paceExempt, wait);
                     return;
                 }
-
+            }
+            else if (wait > TimeSpan.Zero)
+            {
                 session.Logger?.LogInformation(
                     "Duty cycle pace/limit ({Spent:F1}/{Budget:F1} s in the rolling hour); deferring TX of {Bytes} bytes for {Seconds:F1} s",
                     _duty.SpentSeconds, _duty.BudgetSeconds, payload.Length, wait.TotalSeconds);
@@ -306,6 +328,9 @@ public sealed class MeshtasticGate
                 _deferred.Add(new DeferredSend(DateTime.UtcNow, token, to, payload, done, paceExempt));
                 return;
             }
+
+            if (isPresence)
+                CompleteQueuedPresence(to);
 
             session.Send(to, payload);
             done.TrySetResult(true);
@@ -336,11 +361,84 @@ public sealed class MeshtasticGate
         if (due == null)
             return;
 
-        // REQ-TX-PRIO-1: control/presence before text/binary when several deferred frames are due.
+        // Non-presence that is already due goes first so a parked presence cannot cut in front of it.
+        // Among the rest, REQ-TX-PRIO-1: control before text/binary.
         due.Sort(static (a, b) =>
-            MeshtasticTxClassifier.Classify(a.Payload).CompareTo(MeshtasticTxClassifier.Classify(b.Payload)));
+        {
+            var aPresence = IsPresencePayload(a.Payload);
+            var bPresence = IsPresencePayload(b.Payload);
+            if (aPresence != bPresence)
+                return aPresence ? 1 : -1;
+            return MeshtasticTxClassifier.Classify(a.Payload)
+                .CompareTo(MeshtasticTxClassifier.Classify(b.Payload));
+        });
         foreach (var d in due)
             TryDeliver(d.Token, d.To, d.Payload, d.Done, d.PaceExempt); // may re-defer with a fresh due time
+    }
+
+    /// <summary>
+    ///     Radio thread only. Keep a single pending presence per destination, behind any
+    ///     non-presence frame already deferred. Does not complete <paramref name="done"/> —
+    ///     the frame stays queued until a later <see cref="TryDeliver"/> actually sends it.
+    ///     An older presence to the same destination is completed so its waiter does not hang;
+    ///     the newer frame remains pending.
+    /// </summary>
+    private void DeferPresence(object token, uint to, byte[] payload, TaskCompletionSource<bool> done,
+        bool paceExempt, TimeSpan dutyWait)
+    {
+        var presenceSends = new List<DeferredSend>();
+        var rest = new List<DeferredSend>();
+        var nonPresenceDue = new List<DateTime>();
+        foreach (var d in _deferred)
+        {
+            if (IsPresencePayload(d.Payload))
+                presenceSends.Add(d);
+            else
+            {
+                rest.Add(d);
+                nonPresenceDue.Add(d.DueUtc);
+            }
+        }
+
+        var slots = new List<MeshtasticPresenceQueue.Slot>(presenceSends.Count);
+        foreach (var d in presenceSends)
+            slots.Add(new MeshtasticPresenceQueue.Slot(d.DueUtc, d.To, d.Payload));
+
+        var parked = MeshtasticPresenceQueue.Park(
+            slots, to, payload, dutyWait, DateTime.UtcNow, nonPresenceDue);
+
+        _deferred.Clear();
+        _deferred.AddRange(rest);
+        foreach (var slot in parked)
+        {
+            if (slot.To == to)
+            {
+                _deferred.Add(new DeferredSend(slot.DueUtc, token, to, slot.Payload, done, paceExempt));
+                continue;
+            }
+
+            var previous = presenceSends.Find(d => d.To == slot.To);
+            if (previous != null)
+                _deferred.Add(previous with { DueUtc = slot.DueUtc, Payload = slot.Payload });
+        }
+
+        foreach (var previous in presenceSends)
+        {
+            if (previous.To == to)
+                previous.Done.TrySetResult(true);
+        }
+    }
+
+    /// <summary>Drop an older queued presence to <paramref name="to"/> because a newer one is being sent.</summary>
+    private void CompleteQueuedPresence(uint to)
+    {
+        for (var i = _deferred.Count - 1; i >= 0; i--)
+        {
+            if (!IsPresencePayload(_deferred[i].Payload) || _deferred[i].To != to)
+                continue;
+            _deferred[i].Done.TrySetResult(true);
+            _deferred.RemoveAt(i);
+        }
     }
 
     private static bool IsPresencePayload(byte[] payload) =>
