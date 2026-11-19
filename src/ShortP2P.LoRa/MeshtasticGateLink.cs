@@ -92,6 +92,12 @@ public sealed class MeshtasticGateLink : IMeshLink, IMeshNodeCatalog, IMeshRadio
         return new ValueTask(_gate.ApplyTxPowerAsync(_token, txPowerDbm, cancellationToken));
     }
 
+    /// <inheritdoc />
+    public ValueTask ApplyRegionCodeAsync(uint regionCode, CancellationToken cancellationToken = default)
+    {
+        return new ValueTask(_gate.ApplyRegionCodeAsync(_token, regionCode, cancellationToken));
+    }
+
     public async ValueTask DisposeAsync()
     {
         _gate.FrameReceived -= OnGateFrame;

@@ -32,8 +32,17 @@ internal sealed class MeshtasticSerialSession
     private DateTime _nextAnnounceRetryUtc = DateTime.MaxValue;
     private DateTime _nextRefreshRetryUtc = DateTime.MaxValue;
     private byte[] _adminPasskey = [];
-    private int? _pendingTxPowerDbm;
-    private TaskCompletionSource<bool>? _txPowerWait;
+    private LoraPatchKind _loraPatch = LoraPatchKind.None;
+    private int _pendingTxPowerDbm;
+    private uint _pendingRegionCode;
+    private TaskCompletionSource<bool>? _loraPatchWait;
+
+    private enum LoraPatchKind
+    {
+        None,
+        TxPower,
+        Region
+    }
 
     /// <summary>Raw board frames (raised on the radio thread).</summary>
     internal event Action<MeshLinkFrame>? Received;
@@ -131,6 +140,29 @@ internal sealed class MeshtasticSerialSession
     /// </summary>
     internal void BeginApplyTxPower(int txPowerDbm, TaskCompletionSource<bool> done)
     {
+        _pendingTxPowerDbm = txPowerDbm;
+        BeginLoraPatch(LoraPatchKind.TxPower, done, $"TX power {txPowerDbm} dBm");
+    }
+
+    /// <summary>
+    ///     Set Config.LoRaConfig.region. GET the full LoRaConfig, patch only the region field, SET the full blob.
+    ///     A partial config is never sent (that cleared channel, modem preset, and PSK-related channel state).
+    ///     Region code 0 (UNSET) is not written.
+    /// </summary>
+    internal void BeginApplyRegion(uint regionCode, TaskCompletionSource<bool> done)
+    {
+        if (regionCode == MeshtasticProto.RegionCode.Unset)
+        {
+            done.TrySetResult(false);
+            return;
+        }
+
+        _pendingRegionCode = regionCode;
+        BeginLoraPatch(LoraPatchKind.Region, done, $"region {regionCode}");
+    }
+
+    private void BeginLoraPatch(LoraPatchKind kind, TaskCompletionSource<bool> done, string description)
+    {
         EnsureOwner();
         if (_port is not { IsOpen: true } || !_hasLocalNode)
         {
@@ -138,9 +170,9 @@ internal sealed class MeshtasticSerialSession
             return;
         }
 
-        _txPowerWait?.TrySetResult(false);
-        _txPowerWait = done;
-        _pendingTxPowerDbm = txPowerDbm;
+        _loraPatchWait?.TrySetResult(false);
+        _loraPatchWait = done;
+        _loraPatch = kind;
 
         try
         {
@@ -149,16 +181,13 @@ internal sealed class MeshtasticSerialSession
                 MeshtasticProto.BuildToRadioPacket(
                     _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
             WriteRaw(framed);
-            Logger?.LogDebug(
-                "Requested full LoRa config from board before applying TX power {Dbm} dBm",
-                txPowerDbm);
+            Logger?.LogDebug("Requested full LoRa config from board before applying {Change}", description);
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Failed to request LoRa config for TX power apply");
+            Logger?.LogWarning(ex, "Failed to request LoRa config before applying {Change}", description);
             done.TrySetResult(false);
-            _txPowerWait = null;
-            _pendingTxPowerDbm = null;
+            ClearLoraPatch();
         }
     }
 
@@ -389,17 +418,19 @@ internal sealed class MeshtasticSerialSession
                     }
 
                     // Only write after we have the board's current LoRaConfig (get_config_response).
-                    if (_pendingTxPowerDbm is int dbm)
+                    if (_loraPatch != LoraPatchKind.None)
                     {
                         if (MeshtasticProto.TryReadAdminGetConfigResponseLora(admin, out var lora))
                         {
-                            var patched = MeshtasticProto.PatchLoRaConfigTxPower(lora, dbm);
+                            var patched = _loraPatch == LoraPatchKind.Region
+                                ? MeshtasticProto.PatchLoRaConfigRegion(lora, _pendingRegionCode)
+                                : MeshtasticProto.PatchLoRaConfigTxPower(lora, _pendingTxPowerDbm);
                             WriteFullLoraConfig(patched, completeWait: true);
                         }
                         else
                         {
                             Logger?.LogDebug(
-                                "Admin payload while TX-power pending did not contain get_config_response.lora ({Bytes} bytes)",
+                                "Admin payload while LoRa config patch is pending did not contain get_config_response.lora ({Bytes} bytes)",
                                 admin.Length);
                         }
                     }
@@ -421,7 +452,9 @@ internal sealed class MeshtasticSerialSession
 
     private void WriteFullLoraConfig(byte[] loraConfig, bool completeWait)
     {
+        var kind = _loraPatch;
         var dbm = _pendingTxPowerDbm;
+        var region = _pendingRegionCode;
         try
         {
             var admin = MeshtasticProto.BuildAdminSetLoraConfig(loraConfig, _adminPasskey);
@@ -429,22 +462,38 @@ internal sealed class MeshtasticSerialSession
                 MeshtasticProto.BuildToRadioPacket(
                     _localNodeNumber, NextPacketId(), admin, hopLimit: 0, MeshtasticProto.PortNumAdminApp));
             WriteRaw(framed);
-            Logger?.LogInformation(
-                "Meshtastic TX power set to {Dbm} dBm via full LoRaConfig merge (passkey={HasKey}, loraBytes={Len})",
-                dbm, _adminPasskey.Length > 0, loraConfig.Length);
+            if (kind == LoraPatchKind.Region)
+            {
+                Logger?.LogInformation(
+                    "Meshtastic region set to {Region} via full LoRaConfig merge (passkey={HasKey}, loraBytes={Len})",
+                    region, _adminPasskey.Length > 0, loraConfig.Length);
+            }
+            else
+            {
+                Logger?.LogInformation(
+                    "Meshtastic TX power set to {Dbm} dBm via full LoRaConfig merge (passkey={HasKey}, loraBytes={Len})",
+                    dbm, _adminPasskey.Length > 0, loraConfig.Length);
+            }
+
             if (!completeWait)
                 return;
-            _pendingTxPowerDbm = null;
-            _txPowerWait?.TrySetResult(true);
-            _txPowerWait = null;
+            var wait = _loraPatchWait;
+            ClearLoraPatch();
+            wait?.TrySetResult(true);
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Failed to set Meshtastic TX power to {Dbm} dBm", dbm);
-            _pendingTxPowerDbm = null;
-            _txPowerWait?.TrySetResult(false);
-            _txPowerWait = null;
+            Logger?.LogWarning(ex, "Failed to write full LoRaConfig ({Kind})", kind);
+            var wait = _loraPatchWait;
+            ClearLoraPatch();
+            wait?.TrySetResult(false);
         }
+    }
+
+    private void ClearLoraPatch()
+    {
+        _loraPatch = LoraPatchKind.None;
+        _loraPatchWait = null;
     }
 
     private void EnsureOwner()
